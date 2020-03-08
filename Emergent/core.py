@@ -17,6 +17,7 @@ class RaftServer:
 		
 		self.state = 1
 		self.log = []
+		self.serializedLog = []
 		self.currentTerm = 1
 		self.commitIndex = 0
 		self.lastApplied = 0
@@ -32,11 +33,40 @@ class RaftServer:
 
 
 
+	def initLog(self):
+		self.log = [None]
+		return
+
 	def sendHeartBeat(self):
 		pass
 
 	def sendLogEntries(self):
 		pass
+
+	def createLogEntry(self):
+		# This function creates a log entry and appends it to the log.
+		# First ensure that there is enough RAM to store a new log entry.
+		self.log
+		pass
+
+	def replicateLogEntry(self):
+		pass
+
+	def executeLogEntry(self):
+		pass
+
+	def appendRPC_manager(self, e):
+		if 
+		pass
+
+	def commitLogEntry(self, logEntry, ):
+		pass
+
+	def executeCommand(self, func, args, callback):
+		logEntry = self.createLogEntry
+		self.commitLogEntry
+		return
+
 
 	def socketToServer(self, server_idx):
 		IP, port = self.servers[server_idx]
@@ -46,16 +76,18 @@ class RaftServer:
 		socket.connect(addr)
 		return socket
 
-
-	def appendEntriesRPC(self, data, dest_idx, socket):
+	def serializeLogEntry(self, data):
 		binary_data = msgpack.packb(data, use_bin_type=True)
+		return binary_data
+
+	def appendEntriesRPC(self, binary_data, dest_idx, socket):
 		socket.send(binary_data)
 		RESP_bin = socket.recv()
 		RESP = msgpack.unpackb(ACK_bin)
 		success = RESP[0]
 		follower_term = RESP[1]
 		# The leader should send the RPC indefinitely till it receives a "proper" ACK.
-		return success, follower_term
+		return success, follower_termee
 
 	def requestVote(self):
 		pass
@@ -88,3 +120,25 @@ class RaftServer:
 			newTimer.start()
 
 		return newTimer
+
+
+
+class Log:
+
+	def __init__(self, maxSize, maxLength):
+
+		self.log = []
+		self.maxSize = maxSize
+		self.maxLength = maxLength
+
+
+	def addEntry(self, logIndex, term, func, args, isCommitted):
+
+		logEntry = [logIndex, term, func, args, isCommitted]
+		self.log.append(logEntry)
+		# Add code for detecting whether Log has run out of memory. If so, this function should block
+		# until there is an empty slot for a new entry.
+
+	def deleteEntry(self):
+		pass
+
