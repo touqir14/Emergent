@@ -130,6 +130,9 @@ class Log:
 		self.log = []
 		self.maxSize = maxSize
 		self.maxLength = maxLength
+		self.ptr = 0
+		self.iter = None
+
 
 
 	def addEntry(self, logIndex, term, func, args, isCommitted):
@@ -141,4 +144,67 @@ class Log:
 
 	def deleteEntry(self):
 		pass
+
+	def next(self, iteratorID, saveState=True):
+
+		next_node = self.ptrs[iteratorID].next
+		if saveState:
+			if next_node is None:
+				return None
+			else:
+				self.ptrs[iteratorID] = next_node
+				return next_node.value()
+		else:
+			if next_node is None:
+				return None
+			else:
+				return next_node.value()
+
+	def current(self, iteratorID):
+
+		return self.ptrs[iteratorID]
+
+	def prev(self, iteratorID, saveState=True):
+
+		prev_node = self.ptrs[iteratorID].prev
+		if saveState:
+			if prev_node is None:
+				return None
+			else:
+				self.ptrs[iteratorID] = prev_node
+				return prev_node.value()
+		else:
+			if prev_node is None:
+				return None
+			else:
+				return prev_node.value()
+
+
+	def iteratorHalted(self, iteratorID):
+
+		if self.ptrs[iteratorID].next is None:
+			return True
+		else:
+			return False
+
+
+	# def twoWay_Iterator(self):
+
+	# 	run = True
+	# 	while run:
+	# 		# run, forward = yield
+	# 		forward = yield
+	# 		if forward:
+	# 			if 0 <= (self.ptr+1) <= len(self.log) - 1:
+	# 				self.ptr += 1
+	# 				yield self.log[self.ptr]
+	# 			else:
+	# 				yield False
+	# 		else:
+	# 			if 0 <= (self.ptr-1) <= len(self.log) - 1:
+	# 				self.ptr -= 1
+	# 				yield self.log[self.ptr]
+	# 			else:
+	# 				yield False
+
 
