@@ -1,5 +1,6 @@
 import random
 import msgpack
+import utils
 
 
 class RaftServer:
@@ -127,62 +128,243 @@ class Log:
 
 	def __init__(self, maxSize, maxLength):
 
-		self.log = []
+		self.log = llist.dllist()
 		self.maxSize = maxSize
 		self.maxLength = maxLength
-		self.ptr = 0
-		self.iter = None
+		self.ptrs = {}
+		self.ref_point = 0
+		self.nodeSizes = []
+		self.logSize = 0
+		self.clearLog_event = 
 
+
+	def initIterators(self, numNewIterators, obsoleteIterators):
+
+		for iteratorID in obsoleteIterators:
+			if iteratorID in self.ptrs:
+				del self.ptrs[iteratorID]
+
+		totalIterators = len(self.ptrs) + numNewIterators
+		newIDs = []
+
+		if len(obsoleteIterators) >= numNewIterators:
+			newIDs = sorted(obsoleteIterators)[:numNewIterators]
+			for iteratorID in newIDs:
+				self.ptrs[iteratorID] = [self.log.first, self.ref_point]
+		else:
+			allIDs = set(range(totalIterators))
+			usedIDs = set(self.ptrs.keys())
+			newIDs = list(allIDs - usedIDs) 
+			for iteratorID in newIDs:
+				self.ptrs[iteratorID] = [self.log.first, self.ref_point]
+
+		return newIDs
+
+
+	def findSmallestPtr(self):
+
+		smallestPtrIdx = argmin(zip(*self.ptrs.values())[1])
+		ptr, idx = self.ptrs.values()[smallestPtrIdx]
+		idx -= self.ref_point
+		return ptr, idx
+
+
+	def findLargestPtr(self):
+
+		largestPtrIdx = argmax(zip(*self.ptrs.values())[1])
+		ptr, idx = self.ptrs.values()[largestPtrIdx]
+		idx -= self.ref_point
+		return ptr, idx
+
+
+	def addNodeSize(self, size, idx=None):
+
+		if idx is None:
+			if self.logSize + size > self.maxSize:
+				return False
+			else:
+				self.nodeSizes.append(size)
+				self.logSize += size
+		else:
+			if self.logSize - self.nodeSizes[idx] + size > self.maxSize:
+				return False
+			else:
+				self.logSize = self.logSize + size - self.nodeSizes[idx]
+				self.nodeSizes[idx] = size
+
+		return True
+
+
+	def deleteNodeSize(self, idxs):
+
+		sizes = nodeSizes[idxs]
+		if type(sizes) is list:
+			sizeSum = sum(sizes)
+		else:
+			sizeSum = sizes
+
+		self.logSize -= sizeSum
+		del self.nodeSizes[idxs]
+		return
+
+
+	def clearLog(self, reduceBy):
+		"""
+		This function will communicate with workers/actors that are responsible for replicating to each follower
+		and then use the self.ptrs location to pinpoint the part of the log that can be safely deleted. 
+		Add code to save state machine state uptil the point in the log that will be deleted.
+		
+		"""
+
+		while (self.logSize + reduceBy) > self.maxSize or self.log.size >= self.maxLength:
+			smallestPtr, smallestIdx = self.findSmallestPtr()
+			if smallestIdx == 0:
+				self.clearLog_event.wait()
+				self.clearLog_event.clear()
+			self.deleteAllPrevEntries(smallestPtr, smallestIdx)
 
 
 	def addEntry(self, logIndex, term, func, args, isCommitted):
 
 		logEntry = [logIndex, term, func, args, isCommitted]
-		self.log.append(logEntry)
-		# Add code for detecting whether Log has run out of memory. If so, this function should block
-		# until there is an empty slot for a new entry.
+		node = llist.dllistnode(logEntry)
+		node_size = utils.getObjectSize(node)
+		toClear = (not self.addNodeSize(node_size)) or (self.log.size >= self.maxLength)
 
-	def deleteEntry(self):
-		pass
+		if toClear:			
+			self.clearLog()
+			self.addNodeSize(node_size)
+
+		self.log.append(node)
+
+
+	def deleteEntry(self, entry, idx=None):
+
+		if type(entry) is llist.dllistnode:
+			if idx is None:
+				idx = self.log.indexOf(entry)
+			_, smallestPtrIdx = self.findSmallestPtr()
+			if idx < smallestPtrIdx:
+				self.log.remove(entry)
+				self.ref_point += 1
+				self.deleteNodeSize(idx)
+				return True
+			else:
+				return False
+		else:
+			return False
+
+
+	def deleteAllPrevEntries(self, entry, idx=None):
+
+		if type(entry) is not llist.dllistnode:
+			return False
+		else:
+			if type(entry.prev) is llist.dllistnode:
+				if idx is None:
+					idx = self.log.indexOf(entry)
+				_, smallestPtrIdx = self.findSmallestPtr()
+				if idx <= smallestPtrIdx:
+					self.log.clearLeft(entry.prev)
+					self.ref_point += idx
+					self.deleteNodeSize(slice(0, idx))
+
+		return True
+
+
+	# def deleteAllNextEntries(self, entry):
+	# 	# TODO. Don't update ref_point
+
+	# 	if type(entry) is not llist.dllistnode:
+	# 		return False
+	# 	else:
+	# 		if type(entry.next) is llist.dllistnode:
+	# 			self.log.clearRight(entry.next)
+
+	# 	return True
+
+
+	def __len__(self):
+
+		return self.log.size
+
+
+	def jump(self, iteratorID, jump_steps, saveState=True):
+
+		if iteratorID not in self.ptrs:
+			return None
+
+		iteratorIdx = self.ptrs[iteratorID][1] - self.ref_point
+		jumpIdx = iteratorIdx + jump_steps
+
+		if not 0 <= jumpIdx <= self.log.size - 1:
+			return None
+
+		if jump_steps == 0:
+			return self.ptrs[iteratorID][0].value
+
+		if saveState:
+			self.ptrs[iteratorID][0] = self.log.nodeat(jumpIdx)
+			self.ptrs[iteratorID][1] += jump_steps
+			return self.ptrs[iteratorID][0].value
+		else:
+			return self.log.nodeat(jumpIdx).value
+
 
 	def next(self, iteratorID, saveState=True):
 
-		next_node = self.ptrs[iteratorID].next
+		if iteratorID not in self.ptrs:
+			return None
+
+		next_node = self.ptrs[iteratorID][0].next
 		if saveState:
 			if next_node is None:
 				return None
 			else:
-				self.ptrs[iteratorID] = next_node
-				return next_node.value()
+				self.ptrs[iteratorID][0] = next_node
+				self.ptrs[iteratorID][1] += 1
+				return next_node.value
 		else:
 			if next_node is None:
 				return None
 			else:
-				return next_node.value()
+				return next_node.value
 
+	
 	def current(self, iteratorID):
 
-		return self.ptrs[iteratorID]
+		if iteratorID in self.ptrs:
+			return self.ptrs[iteratorID][0].value
+		else:
+			return None
 
+	
 	def prev(self, iteratorID, saveState=True):
 
-		prev_node = self.ptrs[iteratorID].prev
+		if iteratorID not in self.ptrs:
+			return None
+
+		prev_node = self.ptrs[iteratorID][0].prev
 		if saveState:
 			if prev_node is None:
 				return None
 			else:
-				self.ptrs[iteratorID] = prev_node
-				return prev_node.value()
+				self.ptrs[iteratorID][0] = prev_node
+				self.ptrs[iteratorID][1] -= 1
+				return prev_node.value
 		else:
 			if prev_node is None:
 				return None
 			else:
-				return prev_node.value()
+				return prev_node.value
 
 
 	def iteratorHalted(self, iteratorID):
 
-		if self.ptrs[iteratorID].next is None:
+		if iteratorID not in self.ptrs:
+			return None
+
+		if self.ptrs[iteratorID][0].next is None:
 			return True
 		else:
 			return False
