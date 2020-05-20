@@ -55,7 +55,7 @@ class Follower:
         while True:
             clientID, msg = socket.recv_multipart()
             if b'Connection Request' == msg[:18]:
-                _globals._print("From server:",serverID,"|"msg)
+                _globals._print("From server:",serverID,"|",msg)
                 time.sleep(2.1)
                 socket.send_multipart([clientID, b'Connection ACK'])
                 continue

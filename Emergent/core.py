@@ -95,6 +95,7 @@ class RaftServer:
         self.numServers = 1
         self.servers = {}
         self.serverID = None
+        self.port = None
         self.timeoutRange = [0.1,0.2]
         self.protocol = "tcp"
         self.logMaxSize = 10**6
@@ -142,8 +143,12 @@ class RaftServer:
 
         self.entryQueue = queue.Queue()
         self.fetchPendingLogQueue = queue.Queue()
+        self.commitQueue = queue.Queue()
         # self.listenMsgQueue = multiprocessing.Queue()
         
+        self.serverThread = threading.Thread(target=self.start_server, )
+        self.serverThread.start()
+
         self.listenerThread = threading.Thread(target=self.listen_loop, )
         self.listenerThread.start()
 
@@ -394,6 +399,70 @@ class RaftServer:
             self.fetchLogEntry(command, iteratorID, numEntries, pipe_name)
 
 
+    def start_server(self):
+
+        self.connector = Connector(self.serverID, self.protocol, testMode=self.testMode)
+        socket = self.connector.createServerSocket(self.port)
+        self.connector.server_listen(socket, self.serverRequest_handler)
+
+
+    def serverRequest_handler(self, data):
+        """
+        A heartbeat response will always contain success=True
+        """
+
+        clientID, msgType, msg = data[:3]
+
+        if msgType == b'AppendEntries':
+            extra_params = msgpack.unpackb(data[3])
+            leaderCommitIndex, leaderTerm = extra_params['leaderCommitIndex'], extra_params['leaderTerm']
+            if leaderTerm < self.currentTerm:
+                RESP = msgpack.packb([False, self.currentTerm])
+                return 'reply', RESP
+
+            lastEntry = self.log.get_lastEntry()
+            if lastEntry is not None:
+                lastLogIdx, lastLogTerm = self.get_entry_logIndex(lastEntry), self.get_entry_term(lastEntry) 
+                if lastLogTerm == self.get_entry_term(msg) and lastLogIdx == self.get_entry_logIndex(msg):
+                    RESP = msgpack.packb([True, self.currentTerm])
+                    return 'reply', RESP
+
+                if lastLogTerm == self.get_entry_prevLogTerm(msg) and lastLogIdx == self.get_entry_prevLogIndex(msg):
+                    shm_name, logIdx = self.addEntry_follower(msg, leaderCommitIndex)
+                    self.addCommitQueue(shm_name, logIdx, leaderCommitIndex)
+                    RESP = msgpack.packb([True, self.currentTerm])
+                else:
+                    RESP = msgpack.packb([False, self.currentTerm])
+
+                return 'reply', RESP
+
+            else:
+                pass
+
+        elif msgType == b'Heartbeat':
+            RESP = msgpack.packb([True, self.currentTerm])
+            return 'reply', RESP
+
+        elif msgType == b'RequestVote':
+            pass
+
+        return
+
+
+    def addCommitQueue(self, shm_name, logIdx, leaderCommitIndex):
+
+        sendForExecution = []
+        self.commitQueue.put([shm_name, logIdx])
+        while not self.commitQueue.empty():
+            name, idx = self.commitQueue.queue[0]
+            if idx <= leaderCommitIndex:
+                self.commitQueue.get()
+                sendForExecution.append(name)
+            else:
+                break
+
+        self.commitIndex = leaderCommitIndex
+        self.stateMachinePipe.send(['executeLogEntry', self.commitIndex, sendForExecution])
 
     # def replicateLogEntry(self):
     #   pass
@@ -434,7 +503,7 @@ class RaftServer:
     def terminate(self):
 
         self.termination_event.wait()
-
+        self.connector.terminateServer = True
         # time.sleep(2)
         for p in self.workerProcesses:
             self.processPipes[p.name][-1].send(['terminate'])
@@ -459,6 +528,7 @@ class RaftServer:
         # _globals._print('5')
         self.listenerThread.join()
         self.entryAdderThread.join()
+        self.serverThread.join()
         self.log.deleteAllEntries()
 
         _globals._print("Exiting RaftServer instance")
@@ -576,6 +646,20 @@ class StateMachine:
             logger.log_entryExecution(logIdxToExecute)
 
 
+    def loadExecuteLogEntry(self, shm_names):
+
+        for name in shm_names:
+            shm = shared_memory.SharedMemory(name)
+            func_name, args = self.log.get_entry_data(shm)
+            execute_str = '{0}(*args)'.format(func_name)
+            eval(execute_str)
+            utils.freeSharedMemory(shm, clear=False) 
+            """
+            Needs to be clear=True if the log is needed
+            to be cleared regularly.
+            """
+
+
     def listen_loop(self):
 
         while True:
@@ -586,9 +670,12 @@ class StateMachine:
             msg = self.pipe.recv()
             
             if msg[0] == 'executeLogEntry':
-                logIdxToExecute = msg[1]
-                self.updateParams({'commitIndex':logIdxToExecute})
-                self.executeLogEntry(logIdxToExecute)
+                commitIndex = msg[1]
+                self.updateParams({'commitIndex':commitIndex})
+                if len(msg) <= 2:
+                    self.executeLogEntry(commitIndex)
+                else:
+                    self.loadExecuteLogEntry(msg[2]) # msg[2]: a list of shm_names                    
 
             elif msg[0] == 'addLogEntry-ACK':
                 self.addEntryEvent.set()
@@ -623,13 +710,16 @@ class Connector:
         self.connectionRetries = 3
         self.curve_auth = curve_auth
         self.cert_path = cert_path
+        self.terminateServer = False
+        self.terminateClient = False
         self.testMode = testMode
 
         if self.curve_auth:
-            self.createSocket = self._createSocket_CURVE
-
+            self.createClientSocket = self._createClientSocket_CURVE
+            self.createServerSocket = self._createServerSocket_CURVE
         else:
-            self.createSocket = self._createSocket_simple
+            self.createClientSocket = self._createClientSocket_simple
+            self.createServerSocket = self._createServerSocket_simple
 
 
     def connect(self, socket, addr, destServerID, trials=None):
@@ -640,8 +730,9 @@ class Connector:
         success = False
         for i in range(trials):
             socket.connect(addr)
-            msg = 'Connection Request from Server: {0}'.format(self.serverID)
-            socket.send_string(msg)
+            msgType = bytes('Connection Request', 'ascii')
+            msg = bytes('Connection Request from Server: {0}'.format(self.serverID), 'ascii')
+            socket.send_multipart([msgType, msg])
 
             try:
                 received = socket.recv()
@@ -661,7 +752,7 @@ class Connector:
         return success
 
 
-    def _createSocket_simple(self, servers, destServerID):
+    def _createClientSocket_simple(self, servers, destServerID):
 
         IP, port = servers[destServerID]
         context = zmq.Context()
@@ -675,7 +766,26 @@ class Connector:
         return socket, success, addr, destServerID
 
 
-    def _createSocket_CURVE(self, servers, destServerID):
+    def _createClientSocket_CURVE(self, servers, destServerID):
+
+        """
+        Uses Ironhouse encryption based on CURVE
+        """
+        pass
+
+
+    def _createServerSocket_simple(self, port):
+
+        context = zmq.Context()
+        socket = context.socket(zmq.ROUTER)
+        socket.RCVTIMEO = self.connectionTimeout
+        addr = "{0}://*:{1}".format(self.protocol, port)
+        socket.bind(addr)
+        
+        return socket
+
+
+    def _createServerSocket_CURVE(self, servers, destServerID):
 
         """
         Uses Ironhouse encryption based on CURVE
@@ -686,7 +796,36 @@ class Connector:
     def loadCertificates(self):
         pass
 
-    def appendEntriesRPC(self, data, socket, destServerID):
+
+    def server_listen(self, socket, RESP_handler):
+
+        while not self.terminateServer:
+            try:
+                data = socket.recv_multipart() # data : [clientID, msgType, msg]
+            except Exception as e:
+                continue
+
+            clientID = data[0]
+            if b'Connection Request' == data[1]:
+                if self.testMode:
+                    _globals._print("From server:", self.serverID, "|", data[2])
+                # time.sleep(2.1)
+                socket.send_multipart([clientID, b'Connection ACK'])
+                continue
+            else:
+                cmd, RESP = RESP_handler(data)
+
+            if cmd == 'reply':
+                # delay = random.uniform(0.3, 0.8)
+                socket.send_multipart([clientID, RESP])
+
+
+    def appendEntriesRPC(self, data, socket, destServerID, extra_params, isHeartbeat=False):
+
+        if not isHeartbeat:
+            msgType = b'AppendEntries'
+        else:
+            msgType = b'Heartbeat'
 
         if type(data) is shared_memory.SharedMemory:
             msg = data.buf
@@ -694,9 +833,12 @@ class Connector:
             msg = data
 
         resend = True
-        while True:
+        success = None
+        followerTerm = None
+        extra_params_bin = msgpack.packb(extra_params, use_bin_type=True)
+        while not self.terminateClient:
             if resend: 
-                socket.send(msg)
+                socket.send_multipart([msgType, msg, extra_params_bin])
             
             try:
                 RESP_bin = socket.recv()
@@ -718,7 +860,10 @@ class Connector:
             if self.testMode:
                 _globals._print("Received RESP from server: {0}, address: {1}. Success: {2}, followerTerm: {3}".format(destServerID, socket.LAST_ENDPOINT, success, followerTerm))
 
-        return success, followerTerm
+        if not self.terminateClient:
+            return success, followerTerm
+        else:
+            return None, None
 
 
     def sendHeartbeats(self):
@@ -831,11 +976,11 @@ class CommunicationManager:
                     oldSocket = self.serverSockets[serverID][0]
                     oldSocket.close()
                     self.servers[serverID] = servers[serverID]
-                    socket, success, addr, destServerID = self.connector.createSocket(self.servers, serverID)
+                    socket, success, addr, destServerID = self.connector.createClientSocket(self.servers, serverID)
                     self.serverSockets[serverID] = [socket, success, addr, destServerID] 
             else:
                 self.servers[serverID] = servers[serverID]
-                socket, success, addr, destServerID = self.connector.createSocket(self.servers, serverID)
+                socket, success, addr, destServerID = self.connector.createClientSocket(self.servers, serverID)
                 self.serverSockets[serverID] = [socket, success, addr, destServerID] 
 
         toDelete = set(self.servers.keys()) - set(servers.keys())
@@ -1257,14 +1402,18 @@ class Log:
         return params
 
 
-    def get_entry_data(self, shm):
+    def get_entry_data(self, shm, deserialize=True):
 
         if type(shm) is shared_memory.SharedMemory:
             buf = shm.buf
         elif type(shm) is memoryview or type(shm) is bytes:
             buf = shm
 
-        data = self.deserializeEntry(buf[:-self.params_size])
+        if deserialize:
+            data = self.deserializeEntry(buf[:-self.params_size])
+        else:
+            data = buf[:-self.params_size]
+
         return data
 
 
@@ -1307,6 +1456,23 @@ class Log:
         if self.testMode:
             logger.log_addEntry(node, logIndex)
 
+
+    def addEntry_follower(self, msg, commitIndex):
+
+        params = self.get_entry_params(msg)
+        logIdx = params[0]
+        shm_size = len(msg)
+        total_size = shm_size + 120
+        isCommitted = commitIndex >= params[0]
+        params += [total_size, isCommitted]
+
+        shm = shared_memory.SharedMemory(create=True, size=shm_size)
+        shm.buf[:] = msg
+
+        self.addEntry(shm.name, params)
+        utils.freeSharedMemory(shm, clear=False)
+
+        return shm.name, logIdx
 
     # def addEntryRaw(self, logIndex, term, func, args, isCommitted):
     #   """
@@ -1556,6 +1722,26 @@ class Log:
             return prev_node
         else:
             return prev_node.value
+
+    
+    def get_lastEntry(self):
+
+        if type(self.log.last) is llist.dllistnode:
+            return self.last.log
+        else:
+            return None
+
+    
+    def get_prevEntry(self, entry):
+
+        if type(entry) is not llist.dllistnode:
+            return None
+
+        prev_entry = entry.prev
+        if type(prev_entry) is llist.dllistnode:
+            return prev_entry
+        else:
+            return None
 
 
     def iteratorHalted(self, iteratorID):
