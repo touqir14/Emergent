@@ -14,14 +14,25 @@ import zmq
 from testkit import TestKit
 from collections.abc import Iterable
 import _globals
+from _globals import NO_OP
 import logger
 
 
 
 
 
-def dummy_stateNotifier(state):
-    _globals._print("State changed to", state)
+def dummy_stateNotifier(state, serverID=None):
+    if serverID is not None:
+        _globals._print("Server:", serverID, ".State changed to", state)        
+    else:
+        _globals._print("State changed to", state)
+
+def dummy_executeNotifier(cmdID, serverID=None):
+    if serverID is not None:
+        _globals._print("Server:", serverID, ".Executed: CommandID -", cmdID)        
+    else:
+        _globals._print("Executed: CommandID -", cmdID)
+
 
 class RaftLauncher:
 
@@ -34,13 +45,13 @@ class RaftLauncher:
         self.loadParams(param_path)
         self.raft.initLog()
         # self.raft.initEverything(testMode)
-        self.stateMachine = StateMachine(pipe_b, msgQueue, dummy_stateNotifier, testMode)
+        notifiers = {'stateNotifier':dummy_stateNotifier, 'executeNotifier':dummy_executeNotifier}
+        self.stateMachine = StateMachine(pipe_b, msgQueue, notifiers, self.raft.serverID, testMode)
         # self.launchProcesses()
 
     def loadParams(self, param_path):
         
-        param_mod = Namespace(**run_path(param_path))
-        raftParams = param_mod.raftParams
+        raftParams = Namespace(**run_path(param_path)).raftParams
         for k in raftParams:
             if k in self.raft.__dict__:
                 self.raft.__dict__[k] = raftParams[k]
@@ -48,8 +59,7 @@ class RaftLauncher:
 
     def launchProcesses(self, testkit=None):
         
-        state = 'leader'
-        self.raftProcess = multiprocessing.Process(target=self.raft.start, args=(state, testkit),)
+        self.raftProcess = multiprocessing.Process(target=self.raft.start, args=(testkit,),)
         self.raftProcess.start()
 
     def start(self):
@@ -95,8 +105,9 @@ class RaftServer:
         self.numServers = 1
         self.servers = {}
         self.serverID = None
+        self.leaderID = None
         self.port = None
-        self.timeoutRange = [0.1,0.2]
+        self.timeoutRange = [1000000,2000000]
         self.protocol = "tcp"
         self.logMaxSize = 10**6
         self.logMaxLength = 10**8
@@ -110,7 +121,11 @@ class RaftServer:
         self.numMajorityServers = 0
         self.stateMachinePipe = stateMachinePipe
         self.listenMsgQueue = msgQueue
-
+        self.electionTimer = None
+        self.recentVotes = {} # Indexed by electionID
+        self.currentElectionID = 0
+        self.hasVoted = set()
+        self.termination = False
         self.testMode = testMode
 
         random.seed(time.time())
@@ -158,6 +173,7 @@ class RaftServer:
 
     def initWorkerProcesses(self):
 
+        appendEntries_event = multiprocessing.Event()
         for i in range(self.numProcesses):
             processName = 'p-'+str(i)
             manager = CommunicationManager(self.serverID, self.testMode)
@@ -172,7 +188,7 @@ class RaftServer:
             self.processPipes[processName] = pipes_in
             pipe_a, pipe_b = multiprocessing.Pipe()
             pipe_a.name, pipe_b.name = 'main', 'main'
-            p = multiprocessing.Process(target=manager.start, args=(self.listenMsgQueue, pipe_b, pipes_out, i),)
+            p = multiprocessing.Process(target=manager.start, args=(self.listenMsgQueue, pipe_b, pipes_out, i, appendEntries_event,),)
             p.name = processName
             self.workerProcesses.append(p)
             self.processPipes[p.name].append(pipe_a)
@@ -183,12 +199,15 @@ class RaftServer:
 
     def initServers(self):
 
+        params = {'commitIndex':self.commitIndex, 'currentTerm':self.currentTerm, 'state':self.state}
+
         for process_name in self.processPipes:
             mainPipe = self.processPipes[process_name][-1]
             iteratorIDs = self.processToIteratorIDs[process_name]
             servers = {}
             for iteratorID in iteratorIDs:
                 servers[iteratorID] = self.servers[iteratorID]
+            mainPipe.send(['updateParams', params])
             mainPipe.send(['updateServer', servers])
 
 
@@ -205,40 +224,29 @@ class RaftServer:
             self.processToIteratorIDs[self.workerProcesses[-1].name] += self.iteratorIDs[-remaining:]
 
 
-    def changeState(self, new_state):
+    def initState(self):
 
-        if new_state == 'leader':
-            self.state = 'leader'
-            # params = [lastLogIndex, term, prevLogIndex, prevLogTerm, commitIndex, leaderID]
-            params = {}
-            params['lastLogIndex'] = self.lastLogIndex
-            params['term'] = self.currentTerm
-            params['prevLogIndex'] = self.prevLogIndex
-            params['prevLogTerm'] = self.prevLogTerm
-            params['commitIndex'] = self.commitIndex
-            params['leaderID'] = self.serverID
-            self.stateMachinePipe.send(['newState', new_state, params])
-
-        elif new_state == 'follower':
-            self.state = 'follower'
-            pass
-
-        elif new_state == 'candidate':
-            self.state = 'candidate'
-            pass
+        params = {}
+        params['lastLogIndex'] = self.lastLogIndex
+        params['lastLogTerm'] = self.lastLogTerm
+        params['currentTerm'] = self.currentTerm
+        params['prevLogIndex'] = self.prevLogIndex
+        params['prevLogTerm'] = self.prevLogTerm
+        params['commitIndex'] = self.commitIndex
+        params['leaderID'] = self.leaderID
+        self.stateMachinePipe.send(['newState', self.state, params])
 
 
-    def start(self, new_state, testkit):
+    def start(self, testkit):
 
         if type(testkit) is TestKit:
             self.testkit = testkit
             self.testkit.initListenThread()
-            # _globals._print("yeeee")
         else:
             self.testkit = None
 
         self.initEverything()
-        self.changeState(new_state)
+        self.initState()
         self.terminate()
 
 
@@ -255,12 +263,12 @@ class RaftServer:
 
             elif msg[0] == 'followerTerm':
                 followerTerm = msg[1]
-                # Add code for processing state transitions (to follower) if followerTerm is larger than leader's current term.
-                self.processStaleTerm(followerTerm) 
+                if followerTerm > self.currentTerm:
+                    self.leaderToFollower(followerTerm) 
 
             elif msg[0] == 'successfulReplication':
-                logIndex, iteratorID = msg[1], msg[2]
-                self.successfulReplication_handler(logIndex, iteratorID)
+                logIndex, term, iteratorID = msg[1], msg[2], msg[3]
+                self.successfulReplication_handler(logIndex, term, iteratorID)
 
             elif msg[0] == 'addLogEntry':
                 shm_name, params, total_size = msg[1], msg[2], msg[3]
@@ -275,18 +283,21 @@ class RaftServer:
                     break
 
             elif msg[0] == 'stopThread':
-                # _globals._print("From RaftServer.listen_loop")
                 pipe_name = msg[1]
                 processName, pipe_idx = pipe_name[0], pipe_name[1]
                 pipe = self.processPipes[processName][pipe_idx]
                 pipe.send(['terminate'])
+
+            elif msg[0] == 'RequestVote':
+                numVotesReceived, numVotesRequested, term, electionID = msg[1], msg[2], msg[3], msg[4]
+                self.requestVoteRPC_handler(numVotesReceived, numVotesRequested, term, electionID)
 
             else:
                 _globals._print("Wrong command - {0}: From RaftServer.listen_loop".format(msg[0]))
 
 
 
-    def successfulReplication_handler(self, logIndex, iteratorID):
+    def successfulReplication_handler(self, logIndex, term, iteratorID):
 
         self.matchIndex[iteratorID] = logIndex
 
@@ -303,18 +314,16 @@ class RaftServer:
 
 
         if len(self.replicationHistory[logIndex]) >= self.numMajorityServers:
-            # self.commitQueue.put(logIndex)
-            self.commitIndex = logIndex
-            self.sendCommitACK(logIndex)
+            if self.currentTerm == term and self.commitIndex < logIndex: 
+                self.updateParams({'commitIndex' : logIndex})
+                self.log.updateCommitIndex(logIndex)
+                self.stateMachinePipe.send(['executeLogEntry', logIndex])
+                if self.testMode:
+                    logger.log_committed(logIndex, self.replicationHistory[logIndex])
+
             self.replicationHistory[logIndex] = None # Make sure to clean up self.replicationHistory variable!
 
-            if self.testMode:
-                logger.log_committed(logIndex, self.replicationHistory[logIndex])
 
-
-
-    def processStaleTerm(self, followerTerm):
-        pass
 
 
     def fetchLogEntry(self, command, iteratorID, numEntries, pipe_name):
@@ -334,6 +343,9 @@ class RaftServer:
                     logIndex = self.log.get_entry_logIndex(entry)
                     logIndices.append(logIndex)
             
+                    if self.testMode:
+                        _globals._print("fetchLogEntry...", "iteratorID:",iteratorID,"command:",command)
+            
                 else:
                     flags[0] = 1
                     break
@@ -348,6 +360,9 @@ class RaftServer:
                     logIndex = self.log.get_entry_logIndex(entry)
                     logIndices.append(logIndex)
 
+                    if self.testMode:
+                        _globals._print("fetchLogEntry...", "iteratorID:",iteratorID,"command:",command)
+
                 else:
                     shm_names.append(None)
                     break
@@ -361,13 +376,6 @@ class RaftServer:
             self.fetchPendingLogQueue.put([command, iteratorID, 1, pipe_name])
 
 
-    def sendHeartBeat(self):
-        pass
-
-    def sendCommitACK(self, logIndex):
-
-        self.stateMachinePipe.send(['executeLogEntry', logIndex])
-
 
     def entryAdd_loop(self):
 
@@ -376,20 +384,27 @@ class RaftServer:
             if msg == ['terminate']:
                 _globals._print("From Raft Class: entryAdd_loop terminating")
                 break
+            
             shm_name, params, entry_size = msg
-            self.addLogEntry(shm_name, params, entry_size)
+            if params[1] < self.currentTerm or self.state != 'leader': # Not adding an entry from earlier term
+                utils.freeSharedMemory(shm_name)
+                self.stateMachinePipe.send(['addLogEntry-ACK'])
+            else:
+                self.addLogEntry(shm_name, params, entry_size)
+                self.stateMachinePipe.send(['addLogEntry-ACK'])
+                self.processPendingEntries()
 
-
+    
     def addLogEntry(self, shm_name, params, entry_size):
 
         params += [entry_size, False] # Adding isCommitted=False.
-        self.lastLogIndex = params[0]
-        self.lastLogTerm = params[1]
-        self.prevLogIndex = params[2]
-        self.prevLogTerm = params[3]
+        new_params = {}
+        new_params['lastLogIndex'] = params[0]
+        new_params['lastLogTerm'] = params[1]
+        new_params['prevLogIndex'] = params[2]
+        new_params['prevLogTerm'] = params[3]
+        self.updateParams(new_params)
         self.log.addEntry(shm_name, params)
-        self.stateMachinePipe.send(['addLogEntry-ACK'])
-        self.processPendingEntries()
 
 
     def processPendingEntries(self):
@@ -401,134 +416,411 @@ class RaftServer:
 
     def start_server(self):
 
-        self.connector = Connector(self.serverID, self.protocol, testMode=self.testMode)
+        self.connector = Connector(self.serverID, self.protocol, None, testMode=self.testMode)
         socket = self.connector.createServerSocket(self.port)
         self.connector.server_listen(socket, self.serverRequest_handler)
 
 
+    def updateParams(self, params):
+
+        sendToComs = {}
+        options = {'commitIndex', 'currentTerm', 'state'}
+        addToComs = True
+
+        for k in params:
+            addToComs = True
+            if k == 'currentTerm': 
+                if self.currentTerm < params[k]:
+                    self.currentTerm = params[k]
+                else:
+                    addToComs = False
+
+            elif k in self.__dict__:
+                self.__dict__[k] = params[k]
+
+            if k in options and addToComs:
+                sendToComs[k] = params[k]
+
+        if sendToComs != {}:
+            for p_name in self.processPipes:
+                mainPipe = self.processPipes[p_name][-1]
+                mainPipe.send(['updateParams', sendToComs])
+
+
     def serverRequest_handler(self, data):
         """
-        A heartbeat response will always contain success=True
+        For AppendEntriesRPC replies, RESP is expected to be ['appendEntriesRPC_reply', Success, Term, transactionID]:
+        For RequestVoteRPC replies, RESP is expected to be ['requestVoteRPC_reply', term, voteGranted, electionID] 
         """
 
         clientID, msgType, msg = data[:3]
 
         if msgType == b'AppendEntries':
             extra_params = msgpack.unpackb(data[3])
-            leaderCommitIndex, leaderTerm = extra_params['leaderCommitIndex'], extra_params['leaderTerm']
-            if leaderTerm < self.currentTerm:
-                RESP = msgpack.packb([False, self.currentTerm])
-                return 'reply', RESP
-
-            lastEntry = self.log.get_lastEntry()
-            if lastEntry is not None:
-                lastLogIdx, lastLogTerm = self.get_entry_logIndex(lastEntry), self.get_entry_term(lastEntry) 
-                if lastLogTerm == self.get_entry_term(msg) and lastLogIdx == self.get_entry_logIndex(msg):
-                    RESP = msgpack.packb([True, self.currentTerm])
-                    return 'reply', RESP
-
-                if lastLogTerm == self.get_entry_prevLogTerm(msg) and lastLogIdx == self.get_entry_prevLogIndex(msg):
-                    shm_name, logIdx = self.addEntry_follower(msg, leaderCommitIndex)
-                    self.addCommitQueue(shm_name, logIdx, leaderCommitIndex)
-                    RESP = msgpack.packb([True, self.currentTerm])
-                else:
-                    RESP = msgpack.packb([False, self.currentTerm])
-
-                return 'reply', RESP
-
-            else:
-                pass
+            cmd, RESP = self.appendEntriesReq_handler(msg, extra_params)
+            if extra_params['term'] >= self.currentTerm and extra_params['leaderCommitIndex'] > self.commitIndex:
+                self.executeCommittedEntries(self.commitIndex, extra_params['leaderCommitIndex'])
+            return cmd, RESP
 
         elif msgType == b'Heartbeat':
-            RESP = msgpack.packb([True, self.currentTerm])
-            return 'reply', RESP
+            extra_params = msgpack.unpackb(data[3])
+            self.heartBeatReq_handler(extra_params)    
+            return 'no_reply', None
 
         elif msgType == b'RequestVote':
-            pass
+            cmd, RESP = self.requestVoteReq_handler(msg)
+            return cmd, RESP
+
+        else:
+            return 'no_reply', None
+
+
+    def requestVoteReq_handler(self, msg_bin):
+        """
+        RESP is expected to be ['requestVoteRPC_reply', term, voteGranted, electionID]
+        """
+
+        msg = msgpack.unpackb(msg_bin)
+        term_, candidateID_, lastLogIndex_, lastLogTerm_, electionID = msg['term'], msg['candidateID'], msg['lastLogIndex'], msg['lastLogTerm'], msg['electionID']
+        prevTerm = None
+
+        if term_ < self.currentTerm:
+            RESP = msgpack.packb(['requestVoteRPC_reply', self.currentTerm, False, electionID])
+            return 'reply', RESP
+        else:
+            prevTerm = self.currentTerm
+            if self.state == 'leader' and self.currentTerm == term_:
+                self.hasVoted.add(term_)
+            if self.state == 'leader' and self.currentTerm < term_:
+                # self.leaderToFollower(term_)
+                self.leaderToFollower(self.currentTerm)
+            if self.state == 'candidate' and self.currentTerm < term_:
+                self.updateParams({'state' : 'follower'})
+                self.reset_electionTimer()
+                if self.testMode:
+                    _globals._print("Server:", self.serverID,"Transitioned Candidate -> Follower","currentTerm:",self.currentTerm,"Incoming Term:", term_)
+
+            # self.updateParams({'currentTerm' : term_})    
+
+        if term_ in self.hasVoted:
+            RESP = msgpack.packb(['requestVoteRPC_reply', prevTerm, False, electionID])
+            return 'reply', RESP
+
+        if self.testMode:
+            _globals._print("From requestVoteReq_handler. self.lastLogTerm:",self.lastLogTerm,"..self.lastLogIndex:",self.lastLogIndex,"..candidateID:", candidateID_,"..ElectionID:",electionID)
+
+        if self.lastLogTerm < lastLogTerm_:
+            RESP = msgpack.packb(['requestVoteRPC_reply', prevTerm, True, electionID])
+            self.hasVoted.add(term_)
+        
+        elif self.lastLogTerm == lastLogTerm_:
+            if self.lastLogIndex <= lastLogIndex_:
+                RESP = msgpack.packb(['requestVoteRPC_reply', prevTerm, True, electionID])
+                self.hasVoted.add(term_)
+            else:
+                RESP = msgpack.packb(['requestVoteRPC_reply', prevTerm, False, electionID])
+        
+        else:
+            RESP = msgpack.packb(['requestVoteRPC_reply', prevTerm, False, electionID])
+
+        return 'reply', RESP
+
+
+    def heartBeatReq_handler(self, msg):
+
+        if msg['term'] < self.currentTerm:
+            return
+        else:
+            if self.state == 'leader':
+                # by default leaderTerm > self.currentTerm since there can be only 1 leader in each term
+                self.leaderToFollower(msg['term'])
+            else:
+                self.updateParams({'currentTerm' : msg['term']})
+
+        if self.state == 'follower':
+            self.reset_electionTimer()
+
+        if self.state == 'candidate': 
+            # Automatically implies that extra_params['term'] >= self.currentTerm.
+            # So, transition to the follower state
+            self.updateParams({'state' : 'follower'})
+            self.reset_electionTimer()
+            if self.testMode:
+                _globals._print("Server:", self.serverID,"Transitioned Candidate -> Follower")
+
+
+        leaderID_ = msg['leaderID']
+        if msg['leaderCommitIndex'] > self.commitIndex and self.leaderID == leaderID_:
+            # Only execute this if heartbeat does not come from a brand new leader
+            self.executeCommittedEntries(self.commitIndex, msg['leaderCommitIndex'])
+
+        if leaderID_ != self.leaderID:
+            self.updateParams({'leaderID' : leaderID_})
+            self.hasVoted.clear()
+            if self.testMode:
+                _globals._print("Server:", self.serverID,"Updated to LeaderID:",leaderID_)
+
 
         return
 
 
-    def addCommitQueue(self, shm_name, logIdx, leaderCommitIndex):
+    def appendEntriesReq_handler(self, msg, extra_params):
+
+        leaderCommitIndex, leaderTerm, transactionID = extra_params['leaderCommitIndex'], extra_params['term'], extra_params['transactionID']
+        prevTerm = None
+        if leaderTerm < self.currentTerm:
+            RESP = msgpack.packb(['appendEntriesRPC_reply', False, self.currentTerm, transactionID])
+            return 'reply', RESP
+        else:
+            prevTerm = self.currentTerm
+            if self.state == 'leader':
+                # by default leaderTerm > self.currentTerm since there can be only 1 leader in each term
+                self.leaderToFollower(leaderTerm) 
+            else:
+                self.updateParams({'currentTerm' : leaderTerm})
+
+        if self.state == 'follower':
+            self.reset_electionTimer()
+
+        if self.state == 'candidate': 
+            # Automatically implies that extra_params['term'] >= self.currentTerm.
+            # So, transition to the follower state
+            self.updateParams({'state' : 'follower'})
+            self.reset_electionTimer()
+            if self.testMode:
+                _globals._print("Server:", self.serverID,"Transitioned Candidate -> Follower")
+
+
+        if extra_params['leaderID'] != self.leaderID:
+            self.updateParams({'leaderID' : extra_params['leaderID']})
+            self.hasVoted.clear()
+            if self.testMode:
+                _globals._print("Server:", self.serverID,"Updated to LeaderID:", extra_params['leaderID'])
+
+        lastEntry = self.log.get_lastEntry()
+        if lastEntry is not None:
+            lastLogIdx, lastLogTerm = self.log.get_entry_logIndex(lastEntry), self.log.get_entry_term(lastEntry) 
+            lastLogTerm_ , lastLogIdx_ = self.log.get_entry_term(msg), self.log.get_entry_logIndex(msg) 
+
+            if lastLogTerm == lastLogTerm_ and lastLogIdx == lastLogIdx_:
+                _globals._print(0)
+                RESP = msgpack.packb(['appendEntriesRPC_reply', True, prevTerm, transactionID])
+                return 'reply', RESP
+
+            prevLogTerm_ , prevLogIdx_ = self.log.get_entry_prevLogTerm(msg), self.log.get_entry_prevLogIndex(msg)
+            result, node = self.log.findEntry(prevLogIdx_, prevLogTerm_, 'Index&Term')
+
+            if result == 'found_last':
+                _globals._print(1)
+                shm_name, logIdx, params = self.log.addEntry_follower(msg, leaderCommitIndex)
+                new_params = {}
+                new_params['lastLogIndex'] = params[0]
+                new_params['lastLogTerm'] = params[1]
+                new_params['prevLogIndex'] = params[2]
+                new_params['prevLogTerm'] = params[3]
+                self.updateParams(new_params)
+                RESP = msgpack.packb(['appendEntriesRPC_reply', True, prevTerm, transactionID])
+                return 'reply', RESP
+
+            elif result == 'found':
+                _globals._print(2)
+                self.log.deleteNextEntries_follower(node)
+                shm_name, logIdx, params = self.log.addEntry_follower(msg, leaderCommitIndex)
+                new_params = {}
+                new_params['lastLogIndex'] = params[0]
+                new_params['lastLogTerm'] = params[1]
+                new_params['prevLogIndex'] = params[2]
+                new_params['prevLogTerm'] = params[3]
+                self.updateParams(new_params)
+                RESP = msgpack.packb(['appendEntriesRPC_reply', True, prevTerm, transactionID])
+                return 'reply', RESP
+
+            elif result == 'not_found':
+                _globals._print(3)
+                RESP = msgpack.packb(['appendEntriesRPC_reply', False, prevTerm, transactionID])
+                return 'reply', RESP
+
+        else:
+            prevLogTerm_ , prevLogIdx_ = self.log.get_entry_prevLogTerm(msg), self.log.get_entry_prevLogIndex(msg)
+            if self.lastLogIndex == prevLogIdx_ and self.lastLogTerm == prevLogTerm_:
+                _globals._print(4)
+                shm_name, logIdx, params = self.log.addEntry_follower(msg, leaderCommitIndex)
+                new_params = {}
+                new_params['lastLogIndex'] = params[0]
+                new_params['lastLogTerm'] = params[1]
+                new_params['prevLogIndex'] = params[2]
+                new_params['prevLogTerm'] = params[3]
+                self.updateParams(new_params)
+                RESP = msgpack.packb(['appendEntriesRPC_reply', True, prevTerm, transactionID])
+                return 'reply', RESP
+
+            else:
+                _globals._print(5)
+                RESP = msgpack.packb(['appendEntriesRPC_reply', False, prevTerm, transactionID])
+                return 'reply', RESP
+
+
+
+    def executeCommittedEntries(self, old_commitIndex, leaderCommitIndex):
+        # This function is called when leaderCommitIndex is greater than self.commitIndex
 
         sendForExecution = []
-        self.commitQueue.put([shm_name, logIdx])
-        while not self.commitQueue.empty():
-            name, idx = self.commitQueue.queue[0]
-            if idx <= leaderCommitIndex:
-                self.commitQueue.get()
-                sendForExecution.append(name)
+        new_commitIndex = min(self.lastLogIndex, leaderCommitIndex)
+        iteratorID = 'commitIndex'
+
+        if new_commitIndex > old_commitIndex:        
+            while True:
+                node = self.log.next(iteratorID, getNode=True)
+                logIdx = self.log.get_entry_logIndex(node)
+                sendForExecution.append(node.value[0])
+                if logIdx >= new_commitIndex:
+                    break
+
+            self.updateParams({'commitIndex' : new_commitIndex})
+            self.stateMachinePipe.send(['executeLogEntry', self.commitIndex, sendForExecution])
+
+
+    def candidateToLeader(self):
+        # Set ptrs for all followers to the last log entry.
+        # Make sure after that the COMs objects send 'next' requests to the raft servers
+        # Then create and append a no_op log entry
+        # Then reactivate the SM object by changing its state and updating the params.
+        # The first appendEntriesRPC after changing to a leader won't be a heartbeat - it will append no-op entry
+
+        self.log.set_followerPtrsToLast()
+
+        params = {}
+        params['state'] = 'leader'
+        params['leaderID'] = self.serverID
+        self.updateParams(params)
+
+        params = {}
+        params['lastLogIndex'] = self.lastLogIndex
+        params['lastLogTerm'] = self.lastLogTerm
+        params['currentTerm'] = self.currentTerm
+        params['prevLogIndex'] = self.prevLogIndex
+        params['prevLogTerm'] = self.prevLogTerm
+        params['commitIndex'] = self.commitIndex
+        params['leaderID'] = self.leaderID
+        self.stateMachinePipe.send(['newState', 'leader', params])
+
+        if self.testMode:
+            _globals._print("Server:", self.serverID,"Transitioned Candidate -> Leader. currentTerm:", self.currentTerm)
+
+ 
+    def leaderToFollower(self, followerTerm):
+
+        params = {}
+        params['currentTerm'] = followerTerm
+        params['state'] = 'follower'
+        self.updateParams(params)
+        self.stateMachinePipe.send(['newState', 'follower', {}])
+        self.reset_electionTimer(startTimer=True)
+
+        if self.testMode:
+            _globals._print("Server:", self.serverID,"Transitioned Leader -> Follower")
+
+
+    def candidateRunner(self):
+
+        if self.termination:
+            return
+
+        params = {}
+        params['currentTerm'] = self.currentTerm + 1
+        params['currentElectionID'] = self.currentElectionID + 1
+        if self.state != 'candidate':
+            params['state'] = 'candidate'
+            self.reset_electionTimer(startTimer=False)
+
+        self.updateParams(params)
+        self.hasVoted.add(self.currentTerm)
+        self.recentVotes[self.currentElectionID] = [0, self.numServers-1]        
+        electionTimeout = random.uniform(self.timeoutRange[0], self.timeoutRange[1])
+        msg = {}
+        msg['term'] = self.currentTerm
+        msg['candidateID'] = self.serverID
+        msg['lastLogIndex'] = self.lastLogIndex
+        msg['lastLogTerm'] = self.lastLogTerm
+
+        for process_name in self.processPipes:
+            mainPipe = self.processPipes[process_name][-1]
+            mainPipe.send(['requestVoteRPC', msg, electionTimeout, self.currentElectionID])
+
+        if self.testMode:
+            _globals._print_lines(["Server:", self.serverID, ".Started Election:", self.currentElectionID],[msg])
+
+
+
+    def requestVoteRPC_handler(self, numVotesReceived, numVotesRequested, term, electionID):
+
+        # if self.testMode:
+        #     _globals._print("Server:", self.serverID, "requestVoteRPC_handler is invoked")
+
+        params = {}
+        params['currentTerm'] = term
+        self.updateParams(params)
+        if electionID not in self.recentVotes:
+            return
+        if self.state != 'candidate':
+            del self.recentVotes[electionID]
+            return
+
+        self.recentVotes[electionID][0] += numVotesReceived
+        self.recentVotes[electionID][1] -= numVotesRequested
+
+        if self.recentVotes[electionID][1] == 0: # When complete election result is available
+            if self.testMode:
+                _globals._print("Server:", self.serverID,"Vote List with electionID:",electionID,"is",self.recentVotes[electionID])
+
+            if self.recentVotes[electionID][0] >= self.numMajorityServers:
+                self.candidateToLeader()
             else:
-                break
+                self.candidateRunner()
 
-        self.commitIndex = leaderCommitIndex
-        self.stateMachinePipe.send(['executeLogEntry', self.commitIndex, sendForExecution])
+            del self.recentVotes[electionID]
 
-    # def replicateLogEntry(self):
-    #   pass
+        return 
 
-    # def requestVote(self):
-    #   pass
 
-    # def followerToCandidate(self):
-    #   pass
-
-    # def candidateToFollower(self):
-    #   pass
-
-    # def candidateToLeader(self):
-    #   pass
-
-    # def leaderToFollower(self):
-    #   pass
-
-    def resetTimer(self, oldTimer, runnable, startTimer=True):
+    def reset_electionTimer(self, startTimer=True):
         """
         Use threading.Timer for setting a timer. 
         See https://stackoverflow.com/questions/24968311/how-to-set-a-timer-clear-a-timer-in-python
         threading.Timer.interval gives the duration.
         """
-        if oldTimer is not None:
-            oldTimer.cancel()
+        if self.electionTimer is not None:
+            self.electionTimer.cancel()
 
-        timerDuration = random.uniform(self.timeoutRange[0], self.timeoutRange[1])
-        newTimer = threading.Timer(timerDuration, runnable)
-        
-        if startTimer: 
-            newTimer.start()
+        if not self.termination and startTimer:
+            timerDuration = random.uniform(self.timeoutRange[0], self.timeoutRange[1])
+            self.electionTimer = threading.Timer(timerDuration/1000, self.candidateRunner)        
+            self.electionTimer.start()
 
-        return newTimer
+        return 
 
 
     def terminate(self):
 
         self.termination_event.wait()
+        self.termination = True
         self.connector.terminateServer = True
-        # time.sleep(2)
         for p in self.workerProcesses:
             self.processPipes[p.name][-1].send(['terminate'])
 
-        # time.sleep(3)
-        # _globals._print('1')
         for p in self.workerProcesses:
             p.join()
-            # p.kill()
-            # p.close()
 
-        # time.sleep(3)
-        # _globals._print('2')
         self.stateMachinePipe.send(['terminate'])
-        # time.sleep(3)
-        # _globals._print('3')
         self.listenMsgQueue.put(['terminate', False])
-        # time.sleep(3)
-        # _globals._print('4')
         self.entryQueue.put(['terminate'])
-        # time.sleep(3)
-        # _globals._print('5')
         self.listenerThread.join()
         self.entryAdderThread.join()
         self.serverThread.join()
+        self.reset_electionTimer(startTimer=False)
+        with _globals.print_lock:
+            print("Printing Log Chain for Server:", self.serverID)
+            logger.print_log_datachain(self.log)
         self.log.deleteAllEntries()
 
         _globals._print("Exiting RaftServer instance")
@@ -537,7 +829,7 @@ class RaftServer:
 
 class StateMachine:
 
-    def __init__(self, pipe, msgQueue, stateNotifier, testMode=False):
+    def __init__(self, pipe, msgQueue, notifiers, serverID, testMode=False):
 
 
         # params = [lastLogIndex, term, prevLogIndex, prevLogTerm, commitIndex, leaderID]
@@ -547,28 +839,51 @@ class StateMachine:
         self.pipe = pipe
         self.log = Log(None, None, None, testMode)
         self.isLeader = None
+        self.serverID = serverID
         self.testMode = testMode
+        self.globalState = []
         # self.stateNotifier needs to be called to notify the native server that the state \in \{leader, follower, candidate\} has changed.
-        self.stateNotifier = stateNotifier
         self.loopThreadKill = False
+        self.initNotifiers(notifiers)
 
         self.addEntryEvent = threading.Event()
         self.addEntryEvent.set()
 
         self.paramsLock = threading.Lock()
+        self.executerQueue = queue.Queue()
 
         self.loopThread = threading.Thread(target=self.listen_loop,)
         self.loopThread.start()
+
+        self.entryExecuterThread = threading.Thread(target=self.run_entryExecution)
+        self.entryExecuterThread.start()
+
+
+    def initNotifiers(self, notifiers):
+
+        if 'stateNotifier' in notifiers:
+            self.stateNotifier = notifiers['stateNotifier']
+        else:
+            self.stateNotifier = None
+
+        if 'executeNotifier' in notifiers:
+            self.executeNotifier = notifiers['executeNotifier']
+        else:
+            self.executeNotifier = None
 
 
     def terminate(self):
 
         self.loopThreadKill = True
         self.msgQueue.put(['terminate', True])
+        self.executerQueue.put(['terminate'])
         self.loopThread.join()
 
+        if self.testMode:
+            _globals._print_lines(['SM of server:', self.serverID], ['globalState:', self.globalState])
 
-    def updateParams(self, params):
+
+    def updateLogParams(self, params):
 
         if params is None:
             return
@@ -589,19 +904,22 @@ class StateMachine:
         """
 
         if newState == 'leader':
-            if self.isLeader == False or self.isLeader == None:
+            if self.isLeader == False or self.isLeader is None:
                 self.isLeader = True
-                self.stateNotifier(newState)
+                self.addEntryEvent.set()
+                self.executeCommand(NO_OP, [], None)
+                self.stateNotifier(newState, self.serverID)
 
         elif newState == 'follower' or newState == 'candidate':
-            if self.isLeader == True or self.isLeader == None:
+            if self.isLeader == True or self.isLeader is None:
                 self.isLeader = False
-                self.stateNotifier(newState)
+                self.commandBuffer = {}
+                self.stateNotifier(newState, self.serverID)
         # elif newState == 'candidate':
         #   pass
 
 
-    def executeCommand(self, func, args, callback=None):
+    def executeCommand(self, func, args, commandID):
         """
         When a Raft instance shifts transforms into a leader, how should the native server know it 
         """
@@ -611,24 +929,26 @@ class StateMachine:
 
         if not self.isLeader:
             self.addEntryEvent.set()
-            return None
+            return False
 
         if self.loopThreadKill:
-            return None
+            return False
 
         with self.paramsLock:
+            self.params['prevLogIndex'] = self.params['lastLogIndex']
+            prevLogIndex = self.params['prevLogIndex']
             self.params['lastLogIndex'] += 1 
             lastLogIndex = self.params['lastLogIndex']
-            self.params['prevLogIndex'] += 1
-            prevLogIndex = self.params['prevLogIndex']
-            term = self.params['term']
+            self.params['prevLogTerm'] = self.params['lastLogTerm'] 
             prevLogTerm = self.params['prevLogTerm']
-            self.params['prevLogTerm'] = term 
+            self.params['lastLogTerm'] = self.params['currentTerm']
+            term = self.params['lastLogTerm']
             commitIndex = self.params['commitIndex']
             leaderID = self.params['leaderID']
 
+        #params[1] must be lastLogTerm
         params = [lastLogIndex, term, prevLogIndex, prevLogTerm, commitIndex, leaderID]
-        self.commandBuffer[lastLogIndex] = [func, args]
+        self.commandBuffer[lastLogIndex] = [func, args, commandID]
         shm_name, total_size = self.log.createLogEntry(func, args, params)
         # time.sleep(12)
         self.msgQueue.put(('addLogEntry', shm_name, params, total_size))
@@ -636,24 +956,61 @@ class StateMachine:
         return True
 
 
+    def run_entryExecution(self):
 
-    def executeLogEntry(self, logIdxToExecute):
+        while True:
+            msg = self.executerQueue.get() # 1 second timeout
+            
+            if msg[0] == 'terminate':
+                break
 
-        func, args = self.commandBuffer.pop(logIdxToExecute)
-        func(*args)
+            if len(msg) <= 2:
+                self.executeLogEntry()
+            else:
+                self.loadExecuteLogEntry(msg[2]) # msg[2]: a list of shm_names                    
 
-        if self.testMode:
-            logger.log_entryExecution(logIdxToExecute)
+
+
+    def executeLogEntry(self):
+
+        if self.commandBuffer == {}:
+            return
+
+        keys = sorted(self.commandBuffer.keys())
+        for k in keys:
+            if k > self.params['commitIndex']:
+                break
+
+            func, args, commandID = self.commandBuffer.pop(k)
+            result = func(*args)
+            
+            if self.executeNotifier is not None:
+                if commandID is not None:
+                    self.executeNotifier(commandID, self.serverID)
+
+            if self.testMode:
+                logger.log_entryExecution_leader(k)
+                self.globalState.append(result)
 
 
     def loadExecuteLogEntry(self, shm_names):
 
         for name in shm_names:
-            shm = shared_memory.SharedMemory(name)
+            shm = utils.loadSharedMemory(name)
+            if shm == False:
+                continue
             func_name, args = self.log.get_entry_data(shm)
+            logIdx = self.log.get_entry_logIndex(shm.buf)
             execute_str = '{0}(*args)'.format(func_name)
-            eval(execute_str)
+            result = eval(execute_str)
             utils.freeSharedMemory(shm, clear=False) 
+
+            if self.testMode:
+                logger.log_entryExecution_follower(logIdx)
+                self.globalState.append(result)
+                if result is not None:
+                    self.executeNotifier(logIdx, self.serverID)
+
             """
             Needs to be clear=True if the log is needed
             to be cleared regularly.
@@ -671,11 +1028,8 @@ class StateMachine:
             
             if msg[0] == 'executeLogEntry':
                 commitIndex = msg[1]
-                self.updateParams({'commitIndex':commitIndex})
-                if len(msg) <= 2:
-                    self.executeLogEntry(commitIndex)
-                else:
-                    self.loadExecuteLogEntry(msg[2]) # msg[2]: a list of shm_names                    
+                self.updateLogParams({'commitIndex':commitIndex})
+                self.executerQueue.put(msg)
 
             elif msg[0] == 'addLogEntry-ACK':
                 self.addEntryEvent.set()
@@ -685,14 +1039,12 @@ class StateMachine:
                 break
 
             elif msg[0] == 'resetParams':
-                # Add function for sending 'resetParams' in Raft class!
                 new_params = msg[1]
-                self.updateParams(new_params)
+                self.updateLogParams(new_params)
 
             elif msg[0] == 'newState':
-                # Add function for 'newState' in Raft Class!
                 new_state, new_params = msg[1], msg[2]
-                self.updateParams(new_params)
+                self.updateLogParams(new_params)
                 self.processStateChange(new_state)
 
             else:
@@ -702,7 +1054,7 @@ class StateMachine:
 
 class Connector:
 
-    def __init__(self, serverID, protocol, curve_auth=False, cert_path=None, testMode=False):
+    def __init__(self, serverID, protocol, comm, curve_auth=False, cert_path=None, testMode=False):
         
         self.serverID = serverID
         self.protocol = protocol
@@ -713,6 +1065,15 @@ class Connector:
         self.terminateServer = False
         self.terminateClient = False
         self.testMode = testMode
+        self.heartbeat_interval = 1000 # in milliseconds
+        self.socket_timers = {}
+        self.client_socketLocks = {}
+        self.client_transactionIDs = {}
+        self.log = Log(None,None,None,True)
+
+        if comm is not None:
+            self.get_extraParams = comm.get_extraParams
+            self.execute_appendEntriesRPC = comm.execute_appendEntriesRPC
 
         if self.curve_auth:
             self.createClientSocket = self._createClientSocket_CURVE
@@ -728,20 +1089,29 @@ class Connector:
             trials = self.connectionRetries
 
         success = False
-        for i in range(trials):
-            socket.connect(addr)
-            msgType = bytes('Connection Request', 'ascii')
-            msg = bytes('Connection Request from Server: {0}'.format(self.serverID), 'ascii')
-            socket.send_multipart([msgType, msg])
+        msgType = bytes('Connection Request', 'ascii')
+        msg = bytes('Connection Request from Server: {0}'.format(self.serverID), 'ascii')
+        resend = True
+        i = 0
 
-            try:
-                received = socket.recv()
-            except Exception as e:
-                continue
+        with self.client_socketLocks[destServerID]:
+            while i < trials:
+                if resend:
+                    socket.connect(addr)
+                    socket.send_multipart([msgType, msg])
 
-            if received == b'Connection ACK':
-                success = True
-                break
+                try:
+                    received = socket.recv()
+                except Exception as e:
+                    resend = True
+                    i += 1
+                    continue
+
+                if received == b'Connection ACK':
+                    success = True
+                    break
+                else:
+                    resend = False
 
         if self.testMode:
             if success:
@@ -761,6 +1131,7 @@ class Connector:
         socket.setsockopt(zmq.IDENTITY, serverID_bin)
         addr = "{0}://{1}:{2}".format(self.protocol, IP, port)
         socket.RCVTIMEO = self.connectionTimeout
+        socket.setsockopt(zmq.RCVHWM, 10**6)
         success = self.connect(socket, addr, destServerID)
         
         return socket, success, addr, destServerID
@@ -780,6 +1151,7 @@ class Connector:
         socket = context.socket(zmq.ROUTER)
         socket.RCVTIMEO = self.connectionTimeout
         addr = "{0}://*:{1}".format(self.protocol, port)
+        socket.setsockopt(zmq.RCVHWM, 10**6)
         socket.bind(addr)
         
         return socket
@@ -797,11 +1169,25 @@ class Connector:
         pass
 
 
+    def flushSocketBuffers(self, serverSockets):
+
+        for v in serverSockets.values():
+            socket, destServerID = v[0], v[3]
+            with self.client_socketLocks[destServerID]:
+                socket.RCVTIMEO = 0
+                while True:
+                    try:
+                        socket.recv_multipart()
+                    except Exception as e:
+                        break
+                socket.RCVTIMEO = self.connectionTimeout
+
+
     def server_listen(self, socket, RESP_handler):
 
         while not self.terminateServer:
             try:
-                data = socket.recv_multipart() # data : [clientID, msgType, msg]
+                data = socket.recv_multipart() # data : [clientID, msgType, msg, extra_params]
             except Exception as e:
                 continue
 
@@ -820,45 +1206,117 @@ class Connector:
                 socket.send_multipart([clientID, RESP])
 
 
-    def appendEntriesRPC(self, data, socket, destServerID, extra_params, isHeartbeat=False):
+    def requestVoteRPC_sendAll(self, params, serverSockets):
 
-        if not isHeartbeat:
-            msgType = b'AppendEntries'
-        else:
-            msgType = b'Heartbeat'
+        msg = msgpack.packb(params, use_bin_type=True)
+        msgType = b'RequestVote'
+        numVotesRequested = len(serverSockets)
+        for v in serverSockets.values():
+            socket, destServerID = v[0], v[3]
+            with self.client_socketLocks[destServerID]:
+                socket.send_multipart([msgType, msg])
+
+        return numVotesRequested
+
+
+    def requestVoteRPC_recvAll(self, serverSockets, electionID):
+
+        recv_all = {}
+        for v in serverSockets.values():
+            socket, destServerID = v[0], v[3]
+            with self.client_socketLocks[destServerID]:
+                socket.RCVTIMEO = 0
+                while True:
+                    try:
+                        RESP_bin = socket.recv()
+                    except Exception as e:
+                        recv_all[destServerID] = None
+                        break
+
+                    if b'Connection ACK' in RESP_bin:
+                        continue
+
+                    # RESP : [MSG_TYPE, term, voteGranted, electionID]
+                    RESP = msgpack.unpackb(RESP_bin)
+
+                    if 'requestVoteRPC_reply' == RESP[0] and electionID == RESP[3]: 
+                        recv_all[destServerID] = RESP
+                        break
+
+                socket.RCVTIMEO = self.connectionTimeout
+
+        return recv_all
+
+
+    def appendEntriesRPC(self, data, socket, destServerID, isHeartbeat=False, repetitions=True):
+
+        # _globals._print("Within appendEntriesRPC")
 
         if type(data) is shared_memory.SharedMemory:
             msg = data.buf
+            # _globals._print("Type of Msg:",type(msg))
+        # else:
+        #     _globals._print("Printing Alternative msg:", data)
+
+        if not isHeartbeat:
+            msgType = b'AppendEntries'
+            self.client_transactionIDs[destServerID] += 1
+            _globals._print("prevLogTerm:", self.log.get_entry_prevLogTerm(msg), "prevLogIdx:", self.log.get_entry_prevLogIndex(msg))
+            # if self.testMode:
+            #     _globals._print("AppendRPC to server:",destServerID)
         else:
-            msg = data
+            msgType = b'Heartbeat'
+            msg = bytes()
+            # if self.testMode:
+            #     _globals._print("Heartbeat to server:",destServerID)
 
         resend = True
         success = None
         followerTerm = None
-        extra_params_bin = msgpack.packb(extra_params, use_bin_type=True)
-        while not self.terminateClient:
-            if resend: 
-                socket.send_multipart([msgType, msg, extra_params_bin])
-            
-            try:
-                RESP_bin = socket.recv()
-                resend = False
-            except Exception as e:
-                if self.testMode: 
-                    _globals._print("Retrying AppendRPC to server: {0} at address: {1}".format(destServerID, socket.LAST_ENDPOINT))
-                    resend = True
-                continue
+        while (not self.terminateClient) and repetitions > 0:
 
-            if RESP_bin[:14] == b'Connection ACK':
+            if type(repetitions) == int:
+                repetitions =- 1
+
+            if resend: 
+                with self.client_socketLocks[destServerID]:
+                    extra_params = self.get_extraParams(['leaderCommitIndex', 'term', 'leaderID'])
+                    extra_params['transactionID'] = self.client_transactionIDs[destServerID]
+                    extra_params_bin = msgpack.packb(extra_params, use_bin_type=True)
+                    socket.send_multipart([msgType, msg, extra_params_bin])
+                    self.reset_heartbeatTimer(destServerID)
+                    if isHeartbeat:
+                        break
+
+            with self.client_socketLocks[destServerID]:
+                try:
+                    RESP_bin = socket.recv()
+                    resend = False
+                except Exception as e:
+                    if self.testMode: 
+                        _globals._print("Retrying AppendRPC to server: {0} at address: {1}".format(destServerID, socket.LAST_ENDPOINT))
+                    resend = True
+                    continue
+
+            if b'Connection ACK' in RESP_bin:
                 continue
 
             RESP = msgpack.unpackb(RESP_bin)
-            success = RESP[0]
-            followerTerm = RESP[1]
-            break
+            if 'appendEntriesRPC_reply' != RESP[0] : 
+                continue
+
+            success = RESP[1]
+            followerTerm = RESP[2]
+            RESP_transactionID = RESP[3]
+
+            if RESP_transactionID < self.client_transactionIDs[destServerID]:
+                _globals._print("skipping transactionID:", RESP_transactionID)
+                continue
 
             if self.testMode:
                 _globals._print("Received RESP from server: {0}, address: {1}. Success: {2}, followerTerm: {3}".format(destServerID, socket.LAST_ENDPOINT, success, followerTerm))
+
+            break
 
         if not self.terminateClient:
             return success, followerTerm
@@ -866,8 +1324,21 @@ class Connector:
             return None, None
 
 
-    def sendHeartbeats(self):
-        pass
+    def reset_heartbeatTimer(self, destServerID):
+
+        # _globals._print("within reset_heartbeatTimer for server:", destServerID)
+
+        if destServerID not in self.socket_timers:
+            return
+            
+        socket = self.socket_timers[destServerID][0]
+        if self.socket_timers[destServerID][1] is not None:
+            self.socket_timers[destServerID][1].cancel()
+        args = [None, socket, destServerID, True, 1]
+        timer = threading.Timer(self.heartbeat_interval/1000, self.execute_appendEntriesRPC, args)
+        self.socket_timers[destServerID][1] = timer
+        timer.start()
+
 
 
 class CommunicationManager:
@@ -883,66 +1354,68 @@ class CommunicationManager:
         self.testkit = None
         self.testMode = testMode
         self.log = Log(None,None,None,True)
-        self.connector = Connector(serverID, self.protocol, testMode=testMode)
+        self.connector = Connector(serverID, self.protocol, self, testMode=testMode)
+        self.commitIndex = None
+        self.currentTerm = None
+        self.reconnect_interval = 60 * 10 * 1000 # 10 mins interval in milliseconds
+        self.terminateAll = False
+        self.reconnectTimer = None
 
         if testMode:
             self.testkit = TestKit(None, ComMan=self)
 
 
-    # def appendEntriesRPC(self, shm, socket):
-    #     binary_data = shm.buf
-    #     socket.send(binary_data)
-    #     RESP_bin = socket.recv()
-    #     RESP = msgpack.unpackb(RESP_bin)
-    #     success = RESP[0]
-    #     followerTerm = RESP[1]
-    #     # The leader should send the RPC indefinitely till it receives a "proper" ACK.
-    #     return success, followerTerm
+
+    def updateParams(self, params):
+
+        for k in params:
+            if k in self.__dict__:
+                if k == 'state':
+                    if params[k] == 'leader':
+                        # self.connector.flushSocketBuffers(self.serverSockets)
+                        self.appendEntries_event.set()
+                        self.connector.terminateClient = False
+                    else:
+                        self.appendEntries_event.clear()
+                        self.connector.terminateClient = True
+                self.__dict__[k] = params[k]
 
 
-    # def createSocket(self, serverID):
-    #     IP, port = self.servers[serverID]
-    #     context = zmq.Context()
-    #     socket = context.socket(zmq.DEALER)
-    #     serverID_bin = str.encode(chr(self.serverID))
-    #     socket.setsockopt(zmq.IDENTITY, serverID_bin)
-    #     addr = "{0}://{1}:{2}".format(self.protocol, IP, port)
-    #     socket.connect(addr)
-    #     socket.send_string('Connected! From server {0}'.format(serverID))
-    #     _globals._print("socket connected: ", socket.LAST_ENDPOINT)
-    #     return socket
 
+    def start(self, msgQueue, pipe, threadPipes, procIdx, appendEntries_event):
 
-    def start(self, msgQueue, pipe, threadPipes, procIdx):
-
-        # _globals._print("GOT to ComMan start")
         self.mainMsgQueue = msgQueue
         self.mainPipe = pipe
         self.threadPipes = threadPipes
         self.procIdx = procIdx
+        self.appendEntries_event = appendEntries_event
+        self.reset_reconnectTimer()
         self.listen_loop()
 
 
     def listen_loop(self):
 
         while True:
-            # _globals._print("GOT to ComMan listen_loop")
             msg = self.mainPipe.recv()
-            # _globals._print("from comMan: ")
-            # _globals._print(msg)
             if msg[0] == 'updateServer':
                 data = msg[1]
-                # self.updateServer(data)
                 self.updateServerIterator(data)
 
             elif msg[0] == 'terminate':
                 self.terminate()
                 _globals._print("From CommunicationManager class: Terminating process")
-                # time.sleep(10)
                 break
 
             elif msg[0] == 'testkit' and self.testkit is not None:
                 self.testkit.processRequest(msg[1], {'procIdx':self.procIdx, 'mode':0})
+
+            elif msg[0] == 'updateParams':
+                params = msg[1]
+                self.updateParams(params)
+
+            elif msg[0] == 'requestVoteRPC':
+                params, electionTimeout, electionID = msg[1], msg[2], msg[3]
+                self.execute_requestVoteRPC(params, electionTimeout, electionID)
 
             else:
                 _globals._print("Wrong command - {0}: From CommunicationManager.listen_loop".format(msg[0]))
@@ -950,6 +1423,11 @@ class CommunicationManager:
 
     
     def terminate(self):
+
+        self.terminateAll = True
+        self.connector.terminateClient = True
+        self.appendEntries_event.set()
+        self.reset_reconnectTimer(startTimer=False)
 
         for _, pipe in self.iteratorThreads.values():
             self.mainMsgQueue.put(['stopThread', pipe.name])
@@ -965,7 +1443,26 @@ class CommunicationManager:
         serverIDs = servers.keys()
         self.updateServer(servers)
         self.updateIterator(serverIDs)
-        # _globals._print("Done")
+
+
+    def reset_reconnectTimer(self, startTimer=True):
+
+        if self.reconnectTimer is not None:
+            self.reconnectTimer.cancel()
+
+        if startTimer:
+            self.reconnectTimer = threading.Timer(self.reconnect_interval/1000, self.reconnect)
+            self.reconnectTimer.start()
+
+
+    def reconnect(self):
+
+        for v in self.serverSockets.values():
+            socket, addr, destServerID = v[0], v[2], v[3]
+            self.connector.connect(socket, addr, destServerID)
+            v[4] = time.time()
+
+        self.reset_reconnectTimer()
 
 
     def updateServer(self, servers):
@@ -976,18 +1473,29 @@ class CommunicationManager:
                     oldSocket = self.serverSockets[serverID][0]
                     oldSocket.close()
                     self.servers[serverID] = servers[serverID]
+                    self.connector.client_socketLocks[serverID] = threading.Lock()
+                    self.connector.client_transactionIDs[serverID] = 0
                     socket, success, addr, destServerID = self.connector.createClientSocket(self.servers, serverID)
-                    self.serverSockets[serverID] = [socket, success, addr, destServerID] 
+                    prevConnectionTime = time.time() 
+                    self.serverSockets[serverID] = [socket, success, addr, destServerID, prevConnectionTime]
+                    self.connector.socket_timers[serverID] = [socket, None]
             else:
                 self.servers[serverID] = servers[serverID]
+                self.connector.client_socketLocks[serverID] = threading.Lock()
+                self.connector.client_transactionIDs[serverID] = 0
                 socket, success, addr, destServerID = self.connector.createClientSocket(self.servers, serverID)
-                self.serverSockets[serverID] = [socket, success, addr, destServerID] 
+                prevConnectionTime = time.time() 
+                self.serverSockets[serverID] = [socket, success, addr, destServerID, prevConnectionTime]
+                self.connector.socket_timers[serverID] = [socket, None]
 
         toDelete = set(self.servers.keys()) - set(servers.keys())
         for serverID in toDelete:
             socket = self.serverSockets.pop(serverID)[0]
             socket.close()
             del self.servers[serverID]
+            del self.connector.socket_timers[serverID]
+            del self.connector.client_socketLocks[serverID]
+            del self.connector.client_transactionIDs[serverID]
 
 
     def updateIterator(self, iteratorIDs):
@@ -1000,7 +1508,6 @@ class CommunicationManager:
             self.threadPipes.append(pipe)
             self.mainMsgQueue.put(['stopThread', pipe.name])
             del self.iteratorThreads[ID]
-            # RaftServer Class must send a terminate command through 
 
         for ID in toAdd:
             pipe = self.threadPipes.pop()
@@ -1009,10 +1516,131 @@ class CommunicationManager:
             t.start()
 
 
+
+    def get_extraParams(self, args):
+
+        extra_params = {}
+        if 'leaderCommitIndex' in args:
+            extra_params['leaderCommitIndex'] = self.commitIndex
+        if 'term' in args:
+            extra_params['term'] = self.currentTerm
+        if 'leaderID' in args:
+            extra_params['leaderID'] = self.serverID
+        if 'candidateID' in args:
+            extra_params['candidateID'] = self.serverID
+        return extra_params
+
+
+    def execute_requestVoteRPC(self, params, electionTimeout, electionID):
+
+        """
+        Whatever the intended electionTimeout is, subtract a small amount like 10ms to 
+        take care of the overhead due of executing code for sending and receiving
+        RPC messages mostly given below (and few other places).
+        Eg. if intended timeout is 500ms, then set electionTimeout: 490ms.
+        """
+
+        self.reset_reconnectTimer()
+        params['electionID'] = electionID
+        numVotesRequested = self.connector.requestVoteRPC_sendAll(params, self.serverSockets)
+        time.sleep(electionTimeout/1000)
+        recv_data = self.connector.requestVoteRPC_recvAll(self.serverSockets, electionID)
+        numVotesReceived = 0
+        term = 0
+
+        for serverID, RESP in recv_data.items():
+            if RESP is not None:
+                if RESP[2]: # if voteGranted is True
+                    numVotesReceived += 1
+                term = max(term, RESP[1])
+
+        self.mainMsgQueue.put(['RequestVote', numVotesReceived, numVotesRequested, term, electionID])
+
+
+
+    def execute_appendEntriesRPC(self, datum, socket, iteratorID, isHeartbeat=False, repetitions=True):
+
+        if type(datum) == list:
+            shm, logIndex, term = datum
+            if shm.buf is None:
+                raise TypeError('from server:', self.serverID, '.shm.buf is None with name:'+shm.name) 
+
+        else:
+            shm, logIndex, term = None, None, None
+
+        if self.state == 'leader':
+            if self.testMode:
+                _globals._print("AppendEntries to server:",iteratorID,"with logIdx:",logIndex,",term:",term)
+            successful, followerTerm = self.connector.appendEntriesRPC(shm, socket, iteratorID, isHeartbeat, repetitions)
+            if successful is None:
+                return
+
+            if self.currentTerm < followerTerm:
+                # self.updateParams({'currentTerm':followerTerm, 'state':'follower'})
+                self.updateParams({'state':'follower'})
+            self.mainMsgQueue.put(['followerTerm', followerTerm, iteratorID])
+
+            if isHeartbeat:
+                return
+                
+            if successful:
+                motion = 'forward'
+                self.mainMsgQueue.put(['successfulReplication', logIndex, term, iteratorID])
+            else:
+                motion = 'backward'
+
+            return motion
+
+        return 'forward'
+
+
+    def replicateLogEntry(self, iteratorID, pipe):
+        """
+        Currently the logic that it uses works correctly for fetching 1 log entry at a time, ie ['next', 1]
+        """
+
+        motion = 'forward'
+        pipe.flags = [0]
+
+        while True:
+
+            self.appendEntries_event.wait()
+
+            if self.terminateAll or iteratorID not in self.iteratorThreads:
+                break
+
+            if motion == 'forward':
+                if self.testMode:
+                    _globals._print("Motion:"+motion,"iteratorID:",iteratorID)
+                data = self.fetchLogEntryData(iteratorID, pipe, ['next', 1])
+            elif motion == 'backward':
+                if self.testMode:
+                    _globals._print("Motion:"+motion,"iteratorID:",iteratorID)
+                data = self.fetchLogEntryData(iteratorID, pipe, ['prev', 1])
+                # datum will be None if the iterator is pointing to the first Log Entry.
+                # Perhaps use that information???
+            elif motion is None:
+                motion = 'forward'
+                continue
+
+            if data == 'terminate':
+                _globals._print("From CommunicationManager class: Terminating thread with iteratorID:", iteratorID)
+                break
+
+            # Later verify whether there is a valid connection using Connector.connect and Connector.sendHeartbeats.
+            # Keep trying till you get a valid connection before sending data via appendRPC msgs.
+            socket = self.serverSockets[iteratorID][0]
+            for datum in data:
+                motion = self.execute_appendEntriesRPC(datum, socket, iteratorID, isHeartbeat=False)                        
+                utils.freeSharedMemory(datum[0], clear=False)
+                # _globals._print("From replicateLogEntry with serverID:", self.serverID)
+            # self.clearLogEntry(data)
+            del data
+
     def fetchLogEntryData(self, iteratorID, pipe, params):
         """
         params[0] : 'next' or 'prev'
-        params[0] : By default : 1 . Could be more than 1 if multiple log entries are needed
+        params[1] : By default : 1 . Could be more than 1 if multiple log entries are needed
         """
 
         if pipe.flags[0] > 0:
@@ -1041,68 +1669,11 @@ class CommunicationManager:
 
         data = []
         for name, logIndex, term in zip(SM_names, logIndices, terms):
-            # _globals._print('shm name:', name)
-            # with _globals.shm_lock:
-            # time.sleep(2)
-            shm = shared_memory.SharedMemory(name=name)
-            # _globals._print(self.log.get_entry_data(shm.buf))
+            shm = utils.loadSharedMemory(name)
             data.append([shm, logIndex, term])
-            # data.append([name, logIndex, term])
 
         return data
 
-
-    # def clearLogEntry(self, shm_objects):
-
-    #     for shm in shm_objects:
-    #         utils.freeSharedMemory(shm, clear=False)
-
-
-    def replicateLogEntry(self, iteratorID, pipe):
-        """
-        Currently the logic that it uses works correctly for fetching 1 log entry at a time, ie ['next', 1]
-        """
-
-        motion = 'forward'
-        pipe.flags = [0]
-
-        while True:
-
-            if iteratorID not in self.iteratorThreads:
-                break
-
-            if motion == 'forward':
-                data = self.fetchLogEntryData(iteratorID, pipe, ['next', 1])
-            elif motion == 'backward':
-                data = self.fetchLogEntryData(iteratorID, pipe, ['prev', 1])
-                # datum will be None if the iterator is pointing to the first Log Entry.
-                # Perhaps use that information???
-            if data == 'terminate':
-                _globals._print("From CommunicationManager class: Terminating thread with iteratorID:", iteratorID)
-                break
-
-            # Later verify whether there is a valid connection using Connector.connect and Connector.sendHeartbeats.
-            # Keep trying till you get a valid connection before sending data via appendRPC msgs.
-            socket = self.serverSockets[iteratorID][0] 
-            for datum in data:
-                shm, logIndex, term = datum
-                # name, logIndex, term = datum
-                # with _globals.shm_lock:
-                # shm = shared_memory.SharedMemory(name=name)
-                # _globals._print(self.log.get_entry_data(buf))
-
-
-                successful, followerTerm = self.connector.appendEntriesRPC(shm, socket, iteratorID)
-                self.mainMsgQueue.put(['followerTerm', followerTerm, iteratorID])
-
-                if successful:
-                    motion = 'forward'
-                    self.mainMsgQueue.put(['successfulReplication', logIndex, iteratorID])
-                else:
-                    motion = 'backward'
-                        
-                utils.freeSharedMemory(shm, clear=False)
-            # self.clearLogEntry(data)
 
 
 
@@ -1121,29 +1692,10 @@ class Log:
         self.matchIndex = None
         self.params_size = 48
         self.testMode = testMode
+        self.logIndexTerm_record = {}
 
+        self.ptrs['commitIndex'] = [self.log.first, self.ref_point]
 
-    # def initIterators(self, numNewIterators, obsoleteIterators):
-
-    #     for iteratorID in obsoleteIterators:
-    #         if iteratorID in self.ptrs:
-    #             del self.ptrs[iteratorID]
-
-    #     totalIterators = len(self.ptrs) + numNewIterators
-    #     newIDs = []
-
-    #     if len(obsoleteIterators) >= numNewIterators:
-    #         newIDs = sorted(obsoleteIterators)[:numNewIterators]
-    #         for iteratorID in newIDs:
-    #             self.ptrs[iteratorID] = [self.log.first, self.ref_point]
-    #     else:
-    #         allIDs = set(range(totalIterators))
-    #         usedIDs = set(self.ptrs.keys())
-    #         newIDs = list(allIDs - usedIDs) 
-    #         for iteratorID in newIDs:
-    #             self.ptrs[iteratorID] = [self.log.first, self.ref_point]
-
-    #     return newIDs
 
 
     def initIterators(self, newIterators, obsoleteIterators):
@@ -1172,6 +1724,15 @@ class Log:
         ptr, idx = list(self.ptrs.values())[largestPtrIdx]
         idx -= self.ref_point
         return ptr, idx
+
+
+    def updateCommitIndex(self, new_commitIndex):
+
+        while True:
+            node = self.next('commitIndex', getNode=True)
+            logIdx = self.get_entry_logIndex(node)
+            if logIdx >= new_commitIndex:
+                break
 
 
     def addNodeSize(self, size, idx=None):
@@ -1444,7 +2005,7 @@ class Log:
     def addEntry(self, shm_name, params):
 
         logIndex, currentTerm, prevLogIndex, prevLogTerm, commitIndex, leaderID, shm_size, isCommitted = params
-        node = llist.dllistnode((shm_name, logIndex, currentTerm, isCommitted, prevLogIndex, prevLogTerm, commitIndex, leaderID, shm_size))
+        node = llist.dllistnode([shm_name, logIndex, currentTerm, isCommitted, prevLogIndex, prevLogTerm, commitIndex, leaderID, shm_size])
         toClear = (not self.addNodeSize(shm_size)) or (self.log.size >= self.maxLength)
 
         if toClear:         
@@ -1452,6 +2013,7 @@ class Log:
             self.addNodeSize(shm_size)
 
         self.log.append(node)
+        self.logIndexTerm_record[(logIndex, currentTerm)] = node
 
         if self.testMode:
             logger.log_addEntry(node, logIndex)
@@ -1471,38 +2033,9 @@ class Log:
 
         self.addEntry(shm.name, params)
         utils.freeSharedMemory(shm, clear=False)
+        # _globals._print("From addEntry_follower")
 
-        return shm.name, logIdx
-
-    # def addEntryRaw(self, logIndex, term, func, args, isCommitted):
-    #   """
-    #   To add : prevLogIndex, prevLogTerm, commitIndex, leaderID
-    #   """
-
-
-    #   logEntry = [func, args]
-    #   binaryLogEntry = self.serializeEntry(logEntry)
-    #   shm_size = len(binaryLogEntry) + self.params_size
-    #   shm = shared_memory.SharedMemory(create=True, size=shm_size)
-    #   shm.buf[:len(binaryLogEntry)] = binaryLogEntry
-    #   utils.encode_int_bytearray(shm.buf, shm_size-1, term)
-    #   utils.encode_int_bytearray(shm.buf, shm_size-1-8, logIndex)
-    #   utils.encode_int_bytearray(shm.buf, shm_size-1-16, prevLogIndex)
-    #   utils.encode_int_bytearray(shm.buf, shm_size-1-24, prevLogTerm)
-    #   utils.encode_int_bytearray(shm.buf, shm_size-1-32, commitIndex)
-    #   utils.encode_int_bytearray(shm.buf, shm_size-1-40, leaderID)
-
-    #   node = llist.dllistnode(shm.buf)
-    #   node_size = utils.getObjectSize(node, set())
-    #   toClear = (not self.addNodeSize(node_size)) or (self.log.size >= self.maxLength)
-
-    #   if toClear:         
-    #       self.clearLog()
-    #       self.addNodeSize(node_size)
-
-    #   self.log.append(node)
-
-
+        return shm.name, logIdx, params
 
 
     def addEntrySerialized(self, binaryLogEntry, logIndex, term, isCommitted):
@@ -1538,6 +2071,8 @@ class Log:
                 if isinstance(entry.value, Iterable):
                     shm_name = entry.value[0]
                     utils.freeSharedMemory(shm_name)
+                    logIdx, term = self.get_entry_logIndex(entry), self.get_entry_term(entry)
+                    self.logIndexTerm_record.pop((logIdx, term))
 
                     if self.testMode:
                         _globals._print("Deleted Entry with logIdx:", self.get_entry_logIndex(entry))
@@ -1569,6 +2104,8 @@ class Log:
                         if isinstance(self.log.first.value, Iterable):
                             shm_name = self.log.first.value[0]
                             utils.freeSharedMemory(shm_name) 
+                            logIdx, term = self.get_entry_logIndex(self.log.first), self.get_entry_term(self.log.first)
+                            self.logIndexTerm_record.pop((logIdx, term))
 
                             if self.testMode:
                                 _globals._print("Deleted Entry with logIdx:", self.get_entry_logIndex(self.log.first))
@@ -1586,6 +2123,8 @@ class Log:
             if isinstance(node.value, Iterable):
                 shm_name = node.value[0]
                 utils.freeSharedMemory(shm_name) 
+                logIdx, term = self.get_entry_logIndex(node), self.get_entry_term(node)
+                self.logIndexTerm_record.pop((logIdx, term))
 
                 if self.testMode:
                     _globals._print("Deleted Entry with logIdx:", self.get_entry_logIndex(node))
@@ -1597,33 +2136,23 @@ class Log:
         self.nodeSizes = []
         self.logSize = 0
 
-    # def deleteAllPrevEntries(self, entry, idx=None):
 
-    #   if type(entry) is not llist.dllistnode:
-    #       return False
-    #   else:
-    #       if type(entry.prev) is llist.dllistnode:
-    #           if idx is None:
-    #               idx = self.log.indexOf(entry)
-    #           _, smallestPtrIdx = self.findSmallestPtr()
-    #           if idx <= smallestPtrIdx:
-    #               self.log.clearLeft(entry.prev)
-    #               self.ref_point += idx
-    #               self.deleteNodeSize(slice(0, idx))
+    def deleteNextEntries_follower(self, node, inclusive=False):
 
-    #   return True
+        if node is not None and not inclusive:
+            node = node.next
 
+        while node is not None:
+            temp = node.next
+            shm = shared_memory.SharedMemory(node.value[0])
+            utils.freeSharedMemory(shm)
+            # _globals._print("From deleteNextEntries_follower")
 
-    # def deleteAllNextEntries(self, entry):
-    #   # TODO. Don't update ref_point
-
-    #   if type(entry) is not llist.dllistnode:
-    #       return False
-    #   else:
-    #       if type(entry.next) is llist.dllistnode:
-    #           self.log.clearRight(entry.next)
-
-    #   return True
+            logIdx, term = self.get_entry_logIndex(node), self.get_entry_term(node)
+            self.logIndexTerm_record.pop((logIdx, term))
+            self.log.remove(node)
+            del node
+            node = temp
 
 
     def __len__(self):
@@ -1711,7 +2240,7 @@ class Log:
 
         prev_node = self.ptrs[iteratorID][0].prev
 
-        if prev_node is None or prev_node.value == 0:
+        if prev_node is None or type(prev_node.value) != list:
             return None
 
         if saveState:
@@ -1723,11 +2252,29 @@ class Log:
         else:
             return prev_node.value
 
-    
+
+    def set_followerPtrsToLast(self):
+        """
+        Update the follower pointers to point to the last log entry.
+        """
+        for iteratorID in self.ptrs:
+            if iteratorID == 'commitIndex':
+                continue
+
+            while True:
+                nextNode = self.next(iteratorID, getNode=True)
+                if nextNode is None:
+                    break
+
+
     def get_lastEntry(self):
 
         if type(self.log.last) is llist.dllistnode:
-            return self.last.log
+            if type(self.log.last.value) == list:
+                return self.log.last
+            else:
+                # print(6)
+                return None
         else:
             return None
 
@@ -1739,9 +2286,31 @@ class Log:
 
         prev_entry = entry.prev
         if type(prev_entry) is llist.dllistnode:
-            return prev_entry
+            if type(prev_entry.value) == list:
+                return prev_entry
+            else:
+                return None
         else:
             return None
+
+
+    def findEntry(self, logIdx, logTerm, mode):
+
+        if mode == 'Index&Term':
+            node = self.logIndexTerm_record.get((logIdx, logTerm))
+            if node is not None:
+                # print(node.value)
+                # print(self.log.last.value)
+                if node.value is self.log.last.value:
+                    return 'found_last', node
+                else:
+                    return 'found', node
+            else:
+                # with _globals.print_lock:
+                #     logger.print_Log_attributes(self)
+                #     print(self.logIndexTerm_record)
+                #     print("logIdx:", logIdx, "term:", logTerm)
+                return 'not_found', None
 
 
     def iteratorHalted(self, iteratorID):
@@ -1756,25 +2325,5 @@ class Log:
             return True
         else:
             return False
-
-
-    # def twoWay_Iterator(self):
-
-    #   run = True
-    #   while run:
-    #       # run, forward = yield
-    #       forward = yield
-    #       if forward:
-    #           if 0 <= (self.ptr+1) <= len(self.log) - 1:
-    #               self.ptr += 1
-    #               yield self.log[self.ptr]
-    #           else:
-    #               yield False
-    #       else:
-    #           if 0 <= (self.ptr-1) <= len(self.log) - 1:
-    #               self.ptr -= 1
-    #               yield self.log[self.ptr]
-    #           else:
-    #               yield False
 
 

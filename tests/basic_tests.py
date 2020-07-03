@@ -46,15 +46,15 @@ def test2():
 
     func = print
     args = ['Executed: log Entry 1']
-    stateMachine.executeCommand(func, args)
+    stateMachine.executeCommand(func, args, 1)
 
     func = print
     args = ['Executed: log Entry 2']
-    stateMachine.executeCommand(func, args)
+    stateMachine.executeCommand(func, args, 2)
 
     func = print
     args = ['Executed: log Entry 3']
-    stateMachine.executeCommand(func, args)
+    stateMachine.executeCommand(func, args, 3)
 
     time.sleep(20)
     testkit.exit()

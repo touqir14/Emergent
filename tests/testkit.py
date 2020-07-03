@@ -15,6 +15,7 @@ class TestKit:
         
         self.ComMan = ComMan
         self.stateMachine = None
+        self.name = ''
 
     def setStateMachine(self, stateMachine):
 
@@ -162,6 +163,15 @@ class TestKit:
         if mode == 0:
             with _globals.processForkLock and _globals.print_lock:
                 logger.print_StateMachine_attributes(self.stateMachine)
+
+
+    def print_SM_globalState(self, mode=0):
+
+        if mode == 0:
+            with _globals.processForkLock and _globals.print_lock:
+                print()
+                print('From TestKit-', self.name)
+                logger.print_StateMachine_globalState(self.stateMachine)
 
 
     def exit(self):

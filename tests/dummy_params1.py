@@ -12,3 +12,8 @@ raftParams['numProcesses'] = 2
 raftParams['maxThreadPerProcess'] = 2
 raftParams['numMajorityServers'] = 2
 raftParams['iteratorIDs'] = list(raftParams['servers'].keys())
+
+raftParams['leaderID'] = 
+
+settings = {}
+settings['certificate_directory'] = 

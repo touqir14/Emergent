@@ -4,7 +4,9 @@ import llist
 import math
 import copy
 import multiprocessing
-
+import _globals
+import socket
+from contextlib import closing
 
 # Use set() for ids when calling this function
 def getObjectSize(o, ids):
@@ -65,9 +67,21 @@ def decode_int_bytearray(array, start, end):
     return int(byte_str, 2)  
 
 
+
+def loadSharedMemory(shm_name):
+
+    # if shm_name == _globals.no_op:
+    #     return False
+
+    mem = multiprocessing.shared_memory.SharedMemory(name=shm_name)
+    return mem
+
+
 def freeSharedMemory(mem, clear=True):
+
     if type(mem) is str:
-        # print("____", mem)
+        # if shm_name == _globals.no_op:
+        #     return False
         mem = multiprocessing.shared_memory.SharedMemory(name=mem)
 
     mem.close()
@@ -75,13 +89,10 @@ def freeSharedMemory(mem, clear=True):
     if clear:
         mem.unlink()    
 
+    # print("Cleared Shared Memory:", mem.name)
 
-
-
-
-# def trial(array, start, end, a):
-
-#     new_array = copy.deepcopy(array)
-#     encode_int_bytearray(new_array, end, a)
-#     i = decode_int_bytearray(new_array, start, end)
-#     print(i)
+def findFreePort():
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+        s.bind(('', 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return s.getsockname()[1]

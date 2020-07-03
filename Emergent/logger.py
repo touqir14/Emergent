@@ -2,6 +2,7 @@ import json
 from queue import Queue
 from collections.abc import Iterable
 import _globals
+import utils
 
 def print_RaftServer_attributes(raft):
 
@@ -51,6 +52,7 @@ def print_RaftServer_attributes(raft):
 
 
 def print_entry_buffer(log, buf):
+
     func_name, args = log.get_entry_data(buf)
     lastLogIndex, term, prevLogIndex, prevLogTerm, commitIndex, leaderID = log.get_entry_params(buf)
     print("*********** New Buffer ***********")
@@ -107,6 +109,7 @@ def print_Log_attributes(log):
     if node == None:
         print("log is empty")
 
+    print("Printing the Log...")
     while node is not None:
         print_node(node)
         node = node.next
@@ -137,6 +140,37 @@ def print_node(node):
     print('shm_size:', shm_size)
 
     print("***************")
+
+
+def print_log_datachain(log):
+
+    if log is None:
+        print('log == None')
+        print('Exiting from print_log_chain')
+        return
+
+    log_dict = None
+
+    if type(log) == dict:
+        log_dict = log
+    else:
+        log_dict = log.__dict__
+
+    node = log_dict['log'].first
+    if node == None:
+        print("log is empty")
+
+    log_chain = []
+    while node is not None:
+        if isinstance(node.value, Iterable):
+            shm_name = node.value[0]
+            shm = utils.loadSharedMemory(shm_name)
+            func_name, args = log.get_entry_data(shm.buf)
+            log_chain.append([func_name, args])
+        node = node.next
+
+    print(log_chain)
+    return log_chain
 
 
 def print_ComMan_attributes(comMan, procIdx):
@@ -183,7 +217,7 @@ def print_StateMachine_attributes(stateMachine):
     if stateMachine is None:
         print('stateMachine == None')
         print('Exiting from print_StateMachine_attributes')
-
+        return
 
     sm_dict = None
 
@@ -213,6 +247,16 @@ def print_StateMachine_attributes(stateMachine):
     print("***************")
 
 
+def print_StateMachine_globalState(stateMachine):
+
+    if stateMachine is None:
+        print('stateMachine == None')
+        print('Exiting from print_StateMachine_globalState')
+        return
+
+    print("Printing StateMachine globalState")
+    print(stateMachine.globalState)
+
 
 # Loggers below
 
@@ -221,9 +265,14 @@ def log_committed(logIdx, rep_history):
     _globals._print_lines(["Committed logIdx:", logIdx], ["rep_history:", rep_history])
 
 
-def log_entryExecution(logIdx):
+def log_entryExecution_leader(logIdx):
 
-    _globals._print_lines(["Executed logIdx:", logIdx])
+    _globals._print_lines(["Leader:Executed logIdx:", logIdx])
+
+
+def log_entryExecution_follower(logIdx):
+
+    _globals._print_lines(["Follower:Executed logIdx:", logIdx])
 
 
 def log_successfulReplication(logIdx, iteratorID):
@@ -234,5 +283,5 @@ def log_addEntry(node, logIdx):
 
     with _globals.print_lock:
         print("Entry Added with logIdx:", logIdx)
-        print_node(node)
+        # print_node(node)
 
