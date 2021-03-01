@@ -1,0 +1,59 @@
+* llist-0.6 (2018-06-30)
+
+  - allow subclassing of list and node types
+  - added appendnode() method to dllist and sllist (contribution from
+    Alex Stennet)
+  - added insertnode() method to dllist and
+    insertnodeafter()/insertnodebefore() methods to sllist
+  - support for cyclic garbabe collection
+
+-----------------------------------------------------------------------
+
+* llist-0.5 (2017-11-18)
+
+  - changed visibility of internal module functions to hidden
+  - hash() function now returns different results for lists containing
+    permuted elements
+  - added owner attribute to nodes (contribution from Anand Aiyer)
+  - added clearing of neighbour and owner references in removed node
+
+-----------------------------------------------------------------------
+
+* llist-0.4 (2013-01-01)
+
+  - Python 3.x support
+
+-----------------------------------------------------------------------
+
+* llist-0.3 (2012-01-22)
+
+  - fixed neighbour references (prev and next) in dangling nodes
+  - implemented clear() method in dllist and sllist
+  - implemented rotate() method in dllist and sllist
+  - fixed reference counting of list weakrefs
+  - fixed segmentation fault when removing a node that does not belong
+    to the list (issue #1)
+  - implemented extend(), extendleft() and extendright() methods in
+    dllist and sllist
+  - changed insert_before() to insertbefore() and insert_after() to
+    insertafter()
+
+-----------------------------------------------------------------------
+
+* llist-0.2 (2011-12-30)
+
+  - subscript operator `lst[x]` now directly returns values stored
+    in the list, not dllistnode objects
+  - implemented nodeat() method in dllist and sllist
+  - fixed segmentation faults in sllist.insert and sllist.delete
+    methods
+  - added missing Py_DECREFs to sllist
+  - added concatenation and in-place concatenation operator
+  - added repeat operator
+  - added hash() support
+
+-----------------------------------------------------------------------
+
+* llist-0.1 (2011-12-26)
+
+  Initial release
