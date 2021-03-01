@@ -160,17 +160,21 @@ def print_log_datachain(log):
     if node == None:
         print("log is empty")
 
-    log_chain = []
+    log_chain1 = []
+    log_chain2 = []
     while node is not None:
         if isinstance(node.value, Iterable):
             shm_name = node.value[0]
             shm = utils.loadSharedMemory(shm_name)
             func_name, args = log.get_entry_data(shm.buf)
-            log_chain.append([func_name, args])
+            logIdx, term = log.get_entry_logIndex(shm.buf), log.get_entry_term(shm.buf)
+            log_chain1.append([func_name, args])
+            log_chain2.append([logIdx, term])
         node = node.next
 
-    print(log_chain)
-    return log_chain
+    # print(log_chain1)
+    print(log_chain2)
+    return 
 
 
 def print_ComMan_attributes(comMan, procIdx):
@@ -279,9 +283,13 @@ def log_successfulReplication(logIdx, iteratorID):
 
     _globals._print_lines(["Replicated logIdx:", logIdx, "to server:", iteratorID])
 
-def log_addEntry(node, logIdx):
+def log_addEntry(node, logIdx, term, useLock=True):
 
-    with _globals.print_lock:
-        print("Entry Added with logIdx:", logIdx)
+    if useLock:
+        with _globals.print_lock:
+            print("Entry Added with logIdx:", logIdx, "and term:", term)
+            # print_node(node)
+    else:
+        print("Entry Added with logIdx:", logIdx, "and term:", term)
         # print_node(node)
 

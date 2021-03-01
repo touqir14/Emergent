@@ -11,8 +11,8 @@ class Router():
     def __init__(self, routes, CURVE=False):
 
         self.routes = routes
-        self.connectionTimeout = 2000
-        # self.connectionTimeout = 1000
+        # self.connectionTimeout = 2000
+        self.connectionTimeout = 1800
         self.protocol = 'tcp'
         self.serverSockets = {}
         self.clientSockets = {}
@@ -32,6 +32,8 @@ class Router():
         else:
             self.createServerSocket = self._createServerSocket_simple
             self.createClientSocket = self._createClientSocket_simple
+
+        self.changeTime = time.time() + 75
 
 
     def start(self):
@@ -63,6 +65,7 @@ class Router():
 
         clientSocket = self.clientSockets[routeID]
         serverSocket = self.serverSockets[routeID]
+        changed = False
 
         while not self.termination:
             try:
@@ -86,6 +89,14 @@ class Router():
             except Exception as e:
                 continue
             serverSocket.send_multipart([clientID, RESP])
+
+            if self.changeTime <= time.time() and not changed:
+                changed = True
+                self.connectionTimeout = 1000
+                clientSocket.RCVTIMEO = self.connectionTimeout
+                serverSocket.RCVTIMEO = self.connectionTimeout
+                self.use_drop_msg = False
+                print("CHANGED!!!")
 
 
     def compute_latency(self, arrival_time):
