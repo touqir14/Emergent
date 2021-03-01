@@ -18,9 +18,6 @@ from _globals import NO_OP
 import logger
 
 
-
-
-
 def dummy_stateNotifier(state, serverID=None):
     if serverID is not None:
         _globals._print("Server:", serverID, ".State changed to", state)        
@@ -44,10 +41,8 @@ class RaftLauncher:
         self.raft = RaftServer(pipe_a, msgQueue, testMode)
         self.loadParams(param_path)
         self.raft.initLog()
-        # self.raft.initEverything(testMode)
         notifiers = {'stateNotifier':dummy_stateNotifier, 'executeNotifier':dummy_executeNotifier}
         self.stateMachine = StateMachine(pipe_b, msgQueue, notifiers, self.raft.serverID, testMode)
-        # self.launchProcesses()
 
     def loadParams(self, param_path):
         
@@ -100,7 +95,6 @@ class RaftServer:
         self.prevLogIndex = -1
         self.prevLogTerm = 1
         self.lastApplied = 0 # For follower
-        # self.nextIndex = []
         self.matchIndex = {}
         self.numServers = 1
         self.servers = {}
@@ -131,13 +125,8 @@ class RaftServer:
 
         random.seed(time.time())
 
-        # self.initLog()
-
 
     def initEverything(self):
-
-        # self.initLog()
-        # self.testMode = testMode
 
         self.initAuxiliaryThreads()
         with _globals.processForkLock:
@@ -160,7 +149,6 @@ class RaftServer:
         self.entryQueue = queue.Queue()
         self.fetchPendingLogQueue = queue.Queue()
         self.commitQueue = queue.Queue()
-        # self.listenMsgQueue = multiprocessing.Queue()
         
         self.serverThread = threading.Thread(target=self.start_server, )
         self.serverThread.start()
@@ -255,9 +243,6 @@ class RaftServer:
 
         while True:
             msg = self.listenMsgQueue.get()
-            # _globals._print("From RaftServer.listen_loop")
-            # _globals._print(msg)
-            # code = msg[0]
             if msg[0] == 'fetchLogEntry':
                 command, iteratorID, numEntries, pipe_name = msg[1], msg[2], msg[3], msg[4]
                 self.fetchLogEntry(command, iteratorID, numEntries, pipe_name)
@@ -274,7 +259,6 @@ class RaftServer:
             elif msg[0] == 'addLogEntry':
                 shm_name, params, total_size = msg[1], msg[2], msg[3]
                 self.entryQueue.put([shm_name, params, total_size])
-                # self.addLogEntry(shm_name, params, total_size) 
 
             elif msg[0] == 'terminate':
                 if msg[1]: # if msg[1] is True, then self.terminate will be executed by the main thread, else not.
@@ -493,13 +477,7 @@ class RaftServer:
             if self.state == 'leader' and self.currentTerm == term_:
                 self.hasVoted.add(term_)
             if self.state == 'leader' and self.currentTerm < term_:
-                # self.leaderToFollower(term_)
                 self.leaderToFollower(self.currentTerm)
-            # if self.state == 'candidate' and self.currentTerm < term_:
-            #     self.updateParams({'state' : 'follower'})
-            #     self.reset_electionTimer()
-            #     if self.testMode:
-            #         _globals._print("Server:", self.serverID,"Transitioned Candidate -> Follower","currentTerm:",self.currentTerm,"Incoming Term:", term_)
 
 
         if term_ in self.hasVoted:
@@ -514,7 +492,6 @@ class RaftServer:
             self.hasVoted.add(term_)
             if self.state == 'candidate':
                 self.updateParams({'state' : 'follower'})                            
-                # self.reset_electionTimer()
                 if self.testMode:
                     _globals._print("Server:", self.serverID,"Transitioned Candidate -> Follower","currentTerm:",self.currentTerm,"Incoming Term:", term_)
             self.reset_electionTimer()
@@ -527,7 +504,6 @@ class RaftServer:
                 self.hasVoted.add(term_)
                 if self.state == 'candidate':
                     self.updateParams({'state' : 'follower'})                            
-                    # self.reset_electionTimer()
                     if self.testMode:
                         _globals._print("Server:", self.serverID,"Transitioned Candidate -> Follower","currentTerm:",self.currentTerm,"Incoming Term:", term_)
                 self.reset_electionTimer()
@@ -540,57 +516,6 @@ class RaftServer:
             RESP = msgpack.packb(['requestVoteRPC_reply', prevTerm, False, electionID])
 
         return 'reply', RESP
-
-
-    # def requestVoteReq_handler(self, msg_bin):
-    #     """
-    #     RESP is expected to be ['requestVoteRPC_reply', term, voteGranted, electionID]
-    #     """
-
-    #     msg = msgpack.unpackb(msg_bin)
-    #     term_, candidateID_, lastLogIndex_, lastLogTerm_, electionID = msg['term'], msg['candidateID'], msg['lastLogIndex'], msg['lastLogTerm'], msg['electionID']
-    #     prevTerm = None
-
-    #     if term_ < self.currentTerm:
-    #         RESP = msgpack.packb(['requestVoteRPC_reply', self.currentTerm, False, electionID])
-    #         return 'reply', RESP
-    #     else:
-    #         prevTerm = self.currentTerm
-    #         if self.state == 'leader' and self.currentTerm == term_:
-    #             self.hasVoted.add(term_)
-    #         if self.state == 'leader' and self.currentTerm < term_:
-    #             # self.leaderToFollower(term_)
-    #             self.leaderToFollower(self.currentTerm)
-    #         if self.state == 'candidate' and self.currentTerm < term_:
-    #             self.updateParams({'state' : 'follower'})
-    #             self.reset_electionTimer()
-    #             if self.testMode:
-    #                 _globals._print("Server:", self.serverID,"Transitioned Candidate -> Follower","currentTerm:",self.currentTerm,"Incoming Term:", term_)
-
-    #         # self.updateParams({'currentTerm' : term_})    
-
-    #     if term_ in self.hasVoted:
-    #         RESP = msgpack.packb(['requestVoteRPC_reply', prevTerm, False, electionID])
-    #         return 'reply', RESP
-
-    #     if self.testMode:
-    #         _globals._print("From requestVoteReq_handler. self.lastLogTerm:",self.lastLogTerm,"..self.lastLogIndex:",self.lastLogIndex,"..candidateID:", candidateID_,"..ElectionID:",electionID)
-
-    #     if self.lastLogTerm < lastLogTerm_:
-    #         RESP = msgpack.packb(['requestVoteRPC_reply', prevTerm, True, electionID])
-    #         self.hasVoted.add(term_)
-        
-    #     elif self.lastLogTerm == lastLogTerm_:
-    #         if self.lastLogIndex <= lastLogIndex_:
-    #             RESP = msgpack.packb(['requestVoteRPC_reply', prevTerm, True, electionID])
-    #             self.hasVoted.add(term_)
-    #         else:
-    #             RESP = msgpack.packb(['requestVoteRPC_reply', prevTerm, False, electionID])
-        
-    #     else:
-    #         RESP = msgpack.packb(['requestVoteRPC_reply', prevTerm, False, electionID])
-
-    #     return 'reply', RESP
 
 
     def heartBeatReq_handler(self, msg):
@@ -626,7 +551,6 @@ class RaftServer:
             self.hasVoted.clear()
             if self.testMode:
                 _globals._print("Server:", self.serverID,"Updated to LeaderID:",leaderID_)
-
 
         return
 
@@ -722,7 +646,6 @@ class RaftServer:
                 return 'reply', RESP
 
             else:
-                # _globals._print(5)
                 RESP = msgpack.packb(['appendEntriesRPC_reply', False, prevTerm, transactionID])
                 return 'reply', RESP
 
@@ -822,9 +745,6 @@ class RaftServer:
 
     def requestVoteRPC_handler(self, numVotesReceived, numVotesRequested, term, electionID):
 
-        # if self.testMode:
-        #     _globals._print("Server:", self.serverID, "requestVoteRPC_handler is invoked")
-
         params = {}
         params['currentTerm'] = term
         self.updateParams(params)
@@ -901,7 +821,6 @@ class StateMachine:
     def __init__(self, pipe, msgQueue, notifiers, serverID, testMode=False):
 
 
-        # params = [lastLogIndex, term, prevLogIndex, prevLogTerm, commitIndex, leaderID]
         self.params = {}
         self.commandBuffer = {}
         self.msgQueue = msgQueue
@@ -984,8 +903,6 @@ class StateMachine:
                 self.isLeader = False
                 self.commandBuffer = {}
                 self.stateNotifier(newState, self.serverID)
-        # elif newState == 'candidate':
-        #   pass
 
 
     def executeCommand(self, func, args, commandID):
@@ -1019,7 +936,6 @@ class StateMachine:
         params = [lastLogIndex, term, prevLogIndex, prevLogTerm, commitIndex, leaderID]
         self.commandBuffer[lastLogIndex] = [func, args, commandID]
         shm_name, total_size = self.log.createLogEntry(func, args, params)
-        # time.sleep(12)
         self.msgQueue.put(('addLogEntry', shm_name, params, total_size))
 
         return True
@@ -1264,14 +1180,12 @@ class Connector:
             if b'Connection Request' == data[1]:
                 if self.testMode:
                     _globals._print("From server:", self.serverID, "|", data[2])
-                # time.sleep(2.1)
                 socket.send_multipart([clientID, b'Connection ACK'])
                 continue
             else:
                 cmd, RESP = RESP_handler(data)
 
             if cmd == 'reply':
-                # delay = random.uniform(0.3, 0.8)
                 socket.send_multipart([clientID, RESP])
 
 
@@ -1307,7 +1221,6 @@ class Connector:
                     if b'Connection ACK' in RESP_bin:
                         continue
 
-                    # RESP : [MSG_TYPE, term, voteGranted, electionID]
                     RESP = msgpack.unpackb(RESP_bin)
 
                     if 'requestVoteRPC_reply' == RESP[0] and electionID == RESP[3]: 
@@ -1321,25 +1234,15 @@ class Connector:
 
     def appendEntriesRPC(self, data, socket, destServerID, isHeartbeat=False, repetitions=True):
 
-        # _globals._print("Within appendEntriesRPC")
-
         if type(data) is shared_memory.SharedMemory:
             msg = data.buf
-            # _globals._print("Type of Msg:",type(msg))
-        # else:
-        #     _globals._print("Printing Alternative msg:", data)
 
         if not isHeartbeat:
             msgType = b'AppendEntries'
             self.client_transactionIDs[destServerID] += 1
-            # _globals._print("prevLogTerm:", self.log.get_entry_prevLogTerm(msg), "prevLogIdx:", self.log.get_entry_prevLogIndex(msg))
-            # if self.testMode:
-            #     _globals._print("AppendRPC to server:",destServerID)
         else:
             msgType = b'Heartbeat'
             msg = bytes()
-            # if self.testMode:
-            #     _globals._print("Heartbeat to server:",destServerID)
 
         resend = True
         success = None
@@ -1397,8 +1300,6 @@ class Connector:
 
     def reset_heartbeatTimer(self, destServerID):
 
-        # _globals._print("within reset_heartbeatTimer for server:", destServerID)
-
         if destServerID not in self.socket_timers:
             return
             
@@ -1443,7 +1344,6 @@ class CommunicationManager:
             if k in self.__dict__:
                 if k == 'state':
                     if params[k] == 'leader':
-                        # self.connector.flushSocketBuffers(self.serverSockets)
                         self.appendEntries_event.set()
                         self.connector.terminateClient = False
                     else:
@@ -1503,10 +1403,8 @@ class CommunicationManager:
         for _, pipe in self.iteratorThreads.values():
             self.mainMsgQueue.put(['stopThread', pipe.name])
 
-        # _globals._print(3)
         for thread, _ in self.iteratorThreads.values():
             thread.join()
-            # _globals._print(4)
 
 
     def updateServerIterator(self, servers):
@@ -1614,7 +1512,6 @@ class CommunicationManager:
         self.reset_reconnectTimer()
         params['electionID'] = electionID
         numVotesRequested = self.connector.requestVoteRPC_sendAll(params, self.serverSockets)
-        # time.sleep(electionTimeout/1000)
         recv_data = self.connector.requestVoteRPC_recvAll(self.serverSockets, electionTimeout, electionID)
         numVotesReceived = 0
         term = 0
@@ -1654,13 +1551,6 @@ class CommunicationManager:
                 motion = 'forward'
             self.mainMsgQueue.put(['followerTerm', followerTerm, iteratorID])
             
-            # elif self.currentTerm >= followerTerm and successful:
-            #     motion = 'forward'
-            #     self.mainMsgQueue.put(['successfulReplication', logIndex, term, iteratorID])
-
-            # elif self.currentTerm >= followerTerm and not successful:
-            #     motion = 'backward'
-
             if successful:
                 motion = 'forward'
                 self.mainMsgQueue.put(['successfulReplication', logIndex, term, iteratorID])
@@ -1710,7 +1600,6 @@ class CommunicationManager:
             for datum in data:
                 motion = self.execute_appendEntriesRPC(datum, socket, iteratorID, isHeartbeat=False)                        
                 utils.freeSharedMemory(datum[0], clear=False)
-                # _globals._print("From replicateLogEntry with serverID:", self.serverID)
 
             del data
 
@@ -1735,7 +1624,6 @@ class CommunicationManager:
             command = params[0]
 
             if command == 'next' or command == 'prev':
-                # pipe.send([code, command, iteratorID, params[1]])
                 self.mainMsgQueue.put([code, command, iteratorID, params[1], pipe.name])
                 data = pipe.recv()
                 if data == ['terminate']:
@@ -1861,9 +1749,6 @@ class Log:
 
         while (self.logSize + reduceBy) > self.maxSize or self.log.size >= self.maxLength:
             smallestPtr, smallestIdx = self.findSmallestPtr()
-            # if smallestIdx == 0:
-            #   self.clearLog_event.wait()
-            #   self.clearLog_event.clear()
             self.deleteAllPrevEntries(smallestPtr, smallestIdx)
 
 
@@ -2073,13 +1958,11 @@ class Log:
         shm = shared_memory.SharedMemory(create=True, size=shm_size)
         shm.buf[:len(binaryLogEntry)] = binaryLogEntry
         self.set_entry_params(shm, params)      
-        # logIndex, term, prevLogIndex, prevLogTerm, commitIndex, leaderID = params
 
         utils.freeSharedMemory(shm, clear=False)
         total_size = shm_size + 120
 
         if self.testMode:
-            # _globals._print("Created SharedMemory:", shm.name)
             pass
 
         return shm.name, total_size
@@ -2124,7 +2007,6 @@ class Log:
 
         self.addEntry(shm.name, params)
         utils.freeSharedMemory(shm, clear=False)
-        # _globals._print("From addEntry_follower")
 
         return shm.name, logIdx, params
 
@@ -2234,17 +2116,14 @@ class Log:
             with _globals.print_lock:
                 print("Server:",self.serverID,".Log Before deleteNextEntries_follower:")
                 logger.print_log_datachain(self)
-                # print(node.value)
 
         if node is not None and not inclusive:
             node = node.next
-            # _globals._print(node.value)
 
         while node is not None:
             temp = node.next
             shm = shared_memory.SharedMemory(node.value[0])
             utils.freeSharedMemory(shm)
-            # _globals._print("From deleteNextEntries_follower")
 
             logIdx, term = self.get_entry_logIndex(node), self.get_entry_term(node)
             self.logIndexTerm_record.pop((logIdx, term))
@@ -2380,7 +2259,6 @@ class Log:
             if type(self.log.last.value) == list:
                 return self.log.last
             else:
-                # print(6)
                 return None
         else:
             return None
@@ -2406,17 +2284,11 @@ class Log:
         if mode == 'Index&Term':
             node = self.logIndexTerm_record.get((logIdx, logTerm))
             if node is not None:
-                # print(node.value)
-                # print(self.log.last.value)
                 if node.value is self.log.last.value:
                     return 'found_last', node
                 else:
                     return 'found', node
             else:
-                # with _globals.print_lock:
-                #     logger.print_Log_attributes(self)
-                #     print(self.logIndexTerm_record)
-                #     print("logIdx:", logIdx, "term:", logTerm)
                 return 'not_found', None
 
 
